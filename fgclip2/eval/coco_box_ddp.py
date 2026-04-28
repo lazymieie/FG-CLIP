@@ -14,6 +14,7 @@ from .templates import imagenet_templates
 import torch.nn.functional as F
 
 from fgclip2.model.strcs.fgclip2 import FG_CLIP2_Model
+from fgclip2.eval.stage_guard import assert_stage2_checkpoint
 from fgclip2.model.strcs.image_processing_fgclip2_fast import Fgclip2ImageProcessorFast
 from fgclip2.model.strcs.image_processing_fgclip2 import Fgclip2ImageProcessor
 from transformers import AutoTokenizer
@@ -100,6 +101,7 @@ def evaluate(args):
 
     tokenizer = AutoTokenizer.from_pretrained(args.model_base)
 
+    assert_stage2_checkpoint(args.model_path, "COCO box classification")
     model = FG_CLIP2_Model.from_pretrained(args.model_path).to(device).eval()
 
     if args.copy_head:

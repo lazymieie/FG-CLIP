@@ -254,7 +254,7 @@ class Fgclip2Config(PretrainedConfig):
     model_type = "fgclip2"
     sub_configs = {"text_config": Fgclip2TextConfig, "vision_config": Fgclip2VisionConfig}
 
-    def __init__(self, text_config=None, vision_config=None, **kwargs):
+    def __init__(self, text_config=None, vision_config=None, training_stage=2, **kwargs):
         super().__init__(**kwargs)
 
         if text_config is None:
@@ -269,6 +269,7 @@ class Fgclip2Config(PretrainedConfig):
         self.vision_config = Fgclip2VisionConfig(**vision_config)
 
         self.initializer_factor = 1.0
+        self.training_stage = training_stage
 
 
 __all__ = ["Fgclip2Config", "Fgclip2TextConfig", "Fgclip2VisionConfig"]

@@ -44,7 +44,8 @@ from torch.utils.data import  IterableDataset
 import random
 import numpy as np
 
-from fgclip2.model.strcs.fgclip2 import FG_CLIP2_Model
+from fgclip2.model.strcs.stage1_model import FG_CLIP2_Stage1_Model
+from fgclip2.model.strcs.stage2_model import FG_CLIP2_Stage2_Model, load_stage1_into_stage2
 from transformers import AutoProcessor,Siglip2ImageProcessor
 
 
@@ -83,6 +84,10 @@ class ModelArguments:
     download_root: Optional[str] = field(default=None)
     log_scale: float = 4.6052
     loss_type: Optional[str] = field(default=None)
+    stage1_model_name_or_path: Optional[str] = field(
+        default=None,
+        metadata={"help": "Optional stage1 checkpoint used to initialize shared stage2 weights."},
+    )
 
 @dataclass
 class DataArguments:
@@ -828,7 +833,7 @@ def make_supervised_data_module(data_args,img_preprocess,tokenizer,is_naflex) ->
 
 
 
-def train():
+def train(training_stage: int = 2):
     global local_rank
 
     parser = transformers.HfArgumentParser(
@@ -848,21 +853,39 @@ def train():
     else:
         pass
 
-    model = FG_CLIP2_Model.from_pretrained(model_args.model_name_or_path)
+    if training_stage == 1:
+        if data_args.add_box_loss or data_args.use_hard_neg:
+            raise ValueError("train_stage1.py does not accept add_box_loss/use_hard_neg.")
+        model = FG_CLIP2_Stage1_Model.from_pretrained(model_args.model_name_or_path)
+    elif training_stage == 2:
+        model = FG_CLIP2_Stage2_Model.from_pretrained(model_args.model_name_or_path)
+        if model_args.stage1_model_name_or_path is not None:
+            missing_keys, unexpected_keys = load_stage1_into_stage2(model, model_args.stage1_model_name_or_path)
+            rank0_print("load_stage1_into_stage2 missing keys:", missing_keys)
+            rank0_print("load_stage1_into_stage2 unexpected keys:", unexpected_keys)
+        elif getattr(model.config, "training_stage", 2) == 1:
+            model.copy_weight()
+            model.copy_dense_feature_head()
+            model.config.training_stage = 2
+        model.config.training_stage = 2
+    else:
+        raise ValueError(f"Unsupported training_stage={training_stage}. Expected 1 or 2.")
 
     config = model.config
     import numpy as np
 
-    model.logit_scale_finegraind = torch.nn.Parameter(torch.ones([]) * model_args.log_scale)
-    model.logit_scale_hardneg = torch.nn.Parameter(torch.ones([]) * model_args.log_scale)
+    if training_stage == 2:
+        model.logit_scale_finegraind = torch.nn.Parameter(torch.ones([]) * model_args.log_scale)
+        model.logit_scale_hardneg = torch.nn.Parameter(torch.ones([]) * model_args.log_scale)
     
     if training_args.from_siglip2:
         print("copy and resize")
         model.resize_postion_embeding()
         model.copy_weight()
         print("copy_weight")
-        model.copy_dense_feature_head()
-        print("copy_dense_feature_head")
+        if training_stage == 2:
+            model.copy_dense_feature_head()
+            print("copy_dense_feature_head")
         print("fine")
 
     model.world_size = training_args.train_use_word_size

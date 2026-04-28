@@ -7,6 +7,7 @@ from tqdm import tqdm
 import itertools
 import numpy as np
 from fgclip2.model.strcs.fgclip2 import FG_CLIP2_Model
+from fgclip2.eval.stage_guard import assert_stage2_checkpoint
 from fgclip2.model.strcs.image_processing_fgclip2 import Fgclip2ImageProcessor
 from transformers import AutoTokenizer
 
@@ -86,6 +87,7 @@ def eval_model(args):
     assert args.naflex
     image_processor = Fgclip2ImageProcessor.from_pretrained(args.model_base)
     tokenizer = AutoTokenizer.from_pretrained(args.model_base)
+    assert_stage2_checkpoint(args.model_path, "FGOVD bbox ROI evaluation")
     model = FG_CLIP2_Model.from_pretrained(args.model_path, device_map="cuda").cuda().eval()
     device = model.device
     
