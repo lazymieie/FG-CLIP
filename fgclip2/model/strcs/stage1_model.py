@@ -3,21 +3,17 @@ from typing import Optional, Tuple, Union
 import torch
 import torch.distributed as dist
 
-from .fgclip2 import FG_CLIP2_Model
+from .base_model import FG_CLIP2_Base_Model
 from .modeling_fgclip2 import Fgclip2Output
 
 
-class FG_CLIP2_Stage1_Model(FG_CLIP2_Model):
+class FG_CLIP2_Stage1_Model(FG_CLIP2_Base_Model):
     """Stage1 model with only global short-text and long-text heads."""
 
     main_input_name = "text_long"
 
     def __init__(self, config):
         super().__init__(config)
-        if hasattr(self, "boxtext_head"):
-            del self.boxtext_head
-        if hasattr(self, "dense_feature_head"):
-            del self.dense_feature_head
         self.config.training_stage = 1
 
     def copy_weight(self):
