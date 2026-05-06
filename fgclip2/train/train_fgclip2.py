@@ -91,6 +91,10 @@ class DataArguments:
     lazy_preprocess: bool = False
     is_multimodal: bool = False
     image_folder: Optional[str] = field(default=None)
+    extra_image_folders: Optional[str] = field(
+        default=None,
+        metadata={"help": "Additional image roots for resolving relative image paths. Use ':' or ',' to separate multiple paths."},
+    )
     image_aspect_ratio: str = 'square'
     image_grid_pinpoints: Optional[str] = field(default=None)
     max_seq_length: int = 64*4-60
@@ -184,19 +188,149 @@ def safe_save_model_for_hf_trainer(trainer: transformers.Trainer,
 import ast
 
 
-class JsonListStore:
-    def __init__(self, data_file: str, max_records: Optional[int] = None):
+class JsonArrayOffsetStore:
+    def __init__(
+        self,
+        data_file: str,
+        max_records: Optional[int] = None,
+        sample_seed: Optional[int] = None,
+        index_file: Optional[str] = None,
+    ):
         self.data_file = data_file
-        with open(data_file, "r", encoding="utf-8") as f:
-            self.data = json.load(f)
-        if max_records is not None:
-            self.data = self.data[:max_records]
+        self.offsets = array("Q")
+        self._fp = None
+        self.index_file = index_file
+
+        if index_file is not None and os.path.exists(index_file):
+            with open(index_file, "rb") as f:
+                self.offsets.fromfile(f, os.path.getsize(index_file) // self.offsets.itemsize)
+            if len(self.offsets) % 2 != 0:
+                raise ValueError(f"Index file {index_file} is corrupted for json array offsets.")
+            if max_records is not None and len(self) != max_records:
+                raise ValueError(
+                    f"Index file {index_file} has {len(self)} records, expected {max_records}."
+                )
+            return
+
+        rng = random.Random(sample_seed) if sample_seed is not None and max_records is not None else None
+        record_count = 0
+        saw_array_start = False
+        in_string = False
+        escape = False
+        brace_depth = 0
+        object_start = None
+
+        reached_array_end = False
+
+        with open(data_file, "rb") as f:
+            while True:
+                chunk = f.read(1024 * 1024)
+                if not chunk:
+                    break
+                chunk_start = f.tell() - len(chunk)
+
+                for idx, byte in enumerate(chunk):
+                    absolute_pos = chunk_start + idx
+                    if not saw_array_start:
+                        if byte in b" \t\r\n":
+                            continue
+                        if byte != ord("["):
+                            raise ValueError(f"{data_file} must be a JSON array of objects.")
+                        saw_array_start = True
+                        continue
+
+                    if brace_depth == 0:
+                        if byte in b" \t\r\n,":
+                            continue
+                        if byte == ord("]"):
+                            reached_array_end = True
+                            break
+                        if byte != ord("{"):
+                            raise ValueError(f"{data_file} must contain JSON objects at the top level.")
+                        object_start = absolute_pos
+                        brace_depth = 1
+                        in_string = False
+                        escape = False
+                        continue
+
+                    if in_string:
+                        if escape:
+                            escape = False
+                        elif byte == ord("\\"):
+                            escape = True
+                        elif byte == ord('"'):
+                            in_string = False
+                        continue
+
+                    if byte == ord('"'):
+                        in_string = True
+                    elif byte == ord("{"):
+                        brace_depth += 1
+                    elif byte == ord("}"):
+                        brace_depth -= 1
+                        if brace_depth == 0:
+                            object_end = absolute_pos + 1
+                            record_count += 1
+                            if rng is not None:
+                                if len(self) < max_records:
+                                    self.offsets.extend([object_start, object_end])
+                                else:
+                                    sample_idx = rng.randrange(record_count)
+                                    if sample_idx < max_records:
+                                        self.offsets[2 * sample_idx] = object_start
+                                        self.offsets[2 * sample_idx + 1] = object_end
+                            else:
+                                self.offsets.extend([object_start, object_end])
+                                if max_records is not None and len(self) >= max_records:
+                                    break
+
+                if max_records is not None and rng is None and len(self) >= max_records:
+                    break
+                if reached_array_end:
+                    break
+
+        if not saw_array_start:
+            raise ValueError(f"{data_file} must be a JSON array of objects.")
+        if brace_depth != 0 or in_string:
+            raise ValueError(f"{data_file} is not a valid JSON array of objects.")
+        if rng is not None and max_records > record_count:
+            raise ValueError(
+                f"Cannot sample {max_records} records from {data_file}; only {record_count} records found."
+            )
+
+        if index_file is not None:
+            index_dir = os.path.dirname(index_file)
+            if index_dir:
+                os.makedirs(index_dir, exist_ok=True)
+            tmp_index_file = f"{index_file}.tmp.{os.getpid()}"
+            with open(tmp_index_file, "wb") as f:
+                self.offsets.tofile(f)
+            os.replace(tmp_index_file, index_file)
 
     def __len__(self):
-        return len(self.data)
+        return len(self.offsets) // 2
+
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        state["_fp"] = None
+        return state
+
+    def _file(self):
+        if self._fp is None:
+            self._fp = open(self.data_file, "rb")
+        return self._fp
 
     def __getitem__(self, index):
-        return self.data[index]
+        if index < 0:
+            index += len(self)
+        if index < 0 or index >= len(self):
+            raise IndexError(index)
+
+        start = self.offsets[2 * index]
+        end = self.offsets[2 * index + 1]
+        f = self._file()
+        f.seek(start)
+        return json.loads(f.read(end - start).decode("utf-8"))
 
 
 class JsonlOffsetStore:
@@ -350,7 +484,12 @@ def build_data_store(
         )
 
     if data_path.endswith(".json"):
-        return JsonListStore(data_path, max_records=max_records)
+        return JsonArrayOffsetStore(
+            data_path,
+            max_records=max_records,
+            sample_seed=sample_seed,
+            index_file=index_file,
+        )
 
     if data_path.endswith(".txt"):
         stores = []
@@ -372,7 +511,7 @@ def build_data_store(
 
     stores = []
     for json_file in sorted(glob.glob(os.path.join(data_path, "*.json"))):
-        stores.append(JsonListStore(json_file))
+        stores.append(JsonArrayOffsetStore(json_file))
     for jsonl_file in sorted(glob.glob(os.path.join(data_path, "*.jsonl"))):
         stores.append(JsonlOffsetStore(jsonl_file))
     return ConcatStore(stores)
@@ -407,6 +546,7 @@ class LazySupervisedBboxDataset(Dataset):
         self.data_args = data_args
         self.preprocess = img_preprocess
         self.image_root = data_args.image_folder
+        self.extra_image_roots = self.parse_image_roots(data_args.extra_image_folders)
         self.max_length = data_args.max_seq_length
         self.base_length = data_args.base_seq_length
         self.use_short_caption = data_args.use_short_caption
@@ -448,12 +588,38 @@ class LazySupervisedBboxDataset(Dataset):
 
         raise KeyError("f_path is required, or images must contain at least one path")
 
+    def parse_image_roots(self, value):
+        if not value:
+            return []
+        image_roots = []
+        for part in value.replace(",", os.pathsep).split(os.pathsep):
+            part = part.strip()
+            if part:
+                image_roots.append(part)
+        return image_roots
+
     def resolve_image_name(self, image_path, is_cn):
         if os.path.isabs(image_path):
             return image_path
-        if is_cn:
-            return os.path.join(self.cn_image_root, image_path)
-        return os.path.join(self.image_root, image_path)
+
+        candidate_roots = []
+        if is_cn and self.cn_image_root:
+            candidate_roots.append(self.cn_image_root)
+        if self.image_root:
+            candidate_roots.append(self.image_root)
+        candidate_roots.extend(self.extra_image_roots)
+
+        first_candidate = None
+        for root in candidate_roots:
+            candidate = os.path.join(root, image_path)
+            if first_candidate is None:
+                first_candidate = candidate
+            if os.path.exists(candidate):
+                return candidate
+
+        if first_candidate is not None:
+            return first_candidate
+        return image_path
 
     def log_missing_image(self, index, image_path, image_name, error):
         if self.missing_image_log_path is None:
