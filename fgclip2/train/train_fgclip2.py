@@ -5,9 +5,11 @@ from dataclasses import dataclass, field
 import json
 import logging
 import pathlib
+import hashlib
 from typing import Dict, Optional, Sequence, List
 from array import array
 from bisect import bisect_right
+import time
 
 import torch
 import random
@@ -94,6 +96,10 @@ class DataArguments:
     extra_image_folders: Optional[str] = field(
         default=None,
         metadata={"help": "Additional image roots for resolving relative image paths. Use ':' or ',' to separate multiple paths."},
+    )
+    index_cache_root: Optional[str] = field(
+        default=None,
+        metadata={"help": "Directory for auto-generated index cache files for json/jsonl datasets."},
     )
     image_aspect_ratio: str = 'square'
     image_grid_pinpoints: Optional[str] = field(default=None)
@@ -187,6 +193,187 @@ def safe_save_model_for_hf_trainer(trainer: transformers.Trainer,
 
 import ast
 
+AUTO_INDEX_LOCK_POLL_SECONDS = 2
+AUTO_INDEX_LOCK_TIMEOUT_SECONDS = 12 * 60 * 60
+
+
+def index_meta_path(index_file: str) -> str:
+    return f"{index_file}.meta.json"
+
+
+def make_auto_index_path(
+    data_file: str,
+    index_cache_root: Optional[str],
+    max_records: Optional[int] = None,
+    sample_seed: Optional[int] = None,
+) -> Optional[str]:
+    if not index_cache_root:
+        return None
+
+    abs_path = os.path.abspath(data_file)
+    digest = hashlib.sha1(abs_path.encode("utf-8")).hexdigest()[:16]
+    basename = os.path.basename(abs_path)
+    suffixes = []
+    if max_records is not None:
+        suffixes.append(f"limit{max_records}")
+    if sample_seed is not None:
+        suffixes.append(f"seed{sample_seed}")
+    suffix = "" if not suffixes else "." + ".".join(suffixes)
+    return os.path.join(index_cache_root, f"{basename}.{digest}{suffix}.idx")
+
+
+def read_index_meta(index_file: str) -> Optional[dict]:
+    meta_path = index_meta_path(index_file)
+    if not os.path.exists(meta_path):
+        return None
+    with open(meta_path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def write_index_meta(index_file: str, meta: dict) -> None:
+    meta_path = index_meta_path(index_file)
+    meta_dir = os.path.dirname(meta_path)
+    if meta_dir:
+        os.makedirs(meta_dir, exist_ok=True)
+    tmp_meta_path = f"{meta_path}.tmp.{os.getpid()}"
+    with open(tmp_meta_path, "w", encoding="utf-8") as f:
+        json.dump(meta, f, ensure_ascii=False, indent=2)
+        f.write("\n")
+    os.replace(tmp_meta_path, meta_path)
+
+
+def build_index_meta(
+    data_file: str,
+    index_kind: str,
+    max_records: Optional[int],
+    sample_seed: Optional[int],
+    total_records: int,
+) -> dict:
+    return {
+        "source_file": os.path.abspath(data_file),
+        "source_size": os.path.getsize(data_file),
+        "source_mtime": os.path.getmtime(data_file),
+        "index_kind": index_kind,
+        "max_records": max_records,
+        "sample_seed": sample_seed,
+        "total_records": total_records,
+        "index_file": None,
+    }
+
+
+def index_matches_source(
+    meta: Optional[dict],
+    data_file: str,
+    max_records: Optional[int],
+    sample_seed: Optional[int],
+) -> bool:
+    if meta is None:
+        return True
+
+    abs_path = os.path.abspath(data_file)
+    source_file = meta.get("source_file", meta.get("jsonl"))
+    if source_file is not None and os.path.abspath(source_file) != abs_path:
+        return False
+
+    source_size = meta.get("source_size", meta.get("jsonl_size"))
+    if source_size is not None and source_size != os.path.getsize(data_file):
+        return False
+
+    source_mtime = meta.get("source_mtime", meta.get("jsonl_mtime"))
+    if source_mtime is not None and source_mtime != os.path.getmtime(data_file):
+        return False
+
+    meta_records = meta.get("max_records", meta.get("sample_size"))
+    if meta_records != max_records:
+        return False
+
+    meta_seed = meta.get("sample_seed", meta.get("seed"))
+    if meta_seed != sample_seed:
+        return False
+
+    return True
+
+
+def load_existing_offsets_if_valid(
+    index_file: Optional[str],
+    data_file: str,
+    offset_array: array,
+    max_records: Optional[int],
+    sample_seed: Optional[int],
+    items_per_record: int,
+):
+    if index_file is None or not os.path.exists(index_file):
+        return False
+
+    meta = read_index_meta(index_file)
+    if not index_matches_source(meta, data_file, max_records, sample_seed):
+        return False
+
+    del offset_array[:]
+    with open(index_file, "rb") as f:
+        offset_array.fromfile(f, os.path.getsize(index_file) // offset_array.itemsize)
+
+    if len(offset_array) % items_per_record != 0:
+        raise ValueError(f"Index file {index_file} is corrupted.")
+
+    expected_records = None if max_records is None else max_records * items_per_record
+    if expected_records is not None and len(offset_array) != expected_records:
+        raise ValueError(
+            f"Index file {index_file} has {len(offset_array) // items_per_record} records, expected {max_records}."
+        )
+
+    return True
+
+
+class IndexBuildLock:
+    def __init__(
+        self,
+        index_file: str,
+        data_file: str,
+        max_records: Optional[int],
+        sample_seed: Optional[int],
+        items_per_record: int,
+    ):
+        self.index_file = index_file
+        self.data_file = data_file
+        self.max_records = max_records
+        self.sample_seed = sample_seed
+        self.items_per_record = items_per_record
+        self.lock_file = f"{index_file}.lock"
+        self.acquired = False
+
+    def acquire(self) -> None:
+        start_time = time.time()
+        while True:
+            try:
+                fd = os.open(self.lock_file, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    f.write(f"{os.getpid()}\n")
+                self.acquired = True
+                return
+            except FileExistsError:
+                if time.time() - start_time > AUTO_INDEX_LOCK_TIMEOUT_SECONDS:
+                    raise TimeoutError(f"Timed out waiting for index lock: {self.lock_file}")
+
+                if os.path.exists(self.index_file):
+                    offsets = array("Q")
+                    if load_existing_offsets_if_valid(
+                        self.index_file,
+                        self.data_file,
+                        offsets,
+                        self.max_records,
+                        self.sample_seed,
+                        self.items_per_record,
+                    ):
+                        return
+
+                time.sleep(AUTO_INDEX_LOCK_POLL_SECONDS)
+
+    def release(self) -> None:
+        if self.acquired and os.path.exists(self.lock_file):
+            os.remove(self.lock_file)
+        self.acquired = False
+
 
 class JsonArrayOffsetStore:
     def __init__(
@@ -201,15 +388,14 @@ class JsonArrayOffsetStore:
         self._fp = None
         self.index_file = index_file
 
-        if index_file is not None and os.path.exists(index_file):
-            with open(index_file, "rb") as f:
-                self.offsets.fromfile(f, os.path.getsize(index_file) // self.offsets.itemsize)
-            if len(self.offsets) % 2 != 0:
-                raise ValueError(f"Index file {index_file} is corrupted for json array offsets.")
-            if max_records is not None and len(self) != max_records:
-                raise ValueError(
-                    f"Index file {index_file} has {len(self)} records, expected {max_records}."
-                )
+        if load_existing_offsets_if_valid(
+            index_file,
+            data_file,
+            self.offsets,
+            max_records,
+            sample_seed,
+            items_per_record=2,
+        ):
             return
 
         rng = random.Random(sample_seed) if sample_seed is not None and max_records is not None else None
@@ -222,72 +408,89 @@ class JsonArrayOffsetStore:
 
         reached_array_end = False
 
-        with open(data_file, "rb") as f:
-            while True:
-                chunk = f.read(1024 * 1024)
-                if not chunk:
-                    break
-                chunk_start = f.tell() - len(chunk)
+        build_lock = None if index_file is None else IndexBuildLock(index_file, data_file, max_records, sample_seed, 2)
+        try:
+            if build_lock is not None:
+                build_lock.acquire()
+                if load_existing_offsets_if_valid(
+                    index_file,
+                    data_file,
+                    self.offsets,
+                    max_records,
+                    sample_seed,
+                    items_per_record=2,
+                ):
+                    return
 
-                for idx, byte in enumerate(chunk):
-                    absolute_pos = chunk_start + idx
-                    if not saw_array_start:
-                        if byte in b" \t\r\n":
+            with open(data_file, "rb") as f:
+                while True:
+                    chunk = f.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    chunk_start = f.tell() - len(chunk)
+
+                    for idx, byte in enumerate(chunk):
+                        absolute_pos = chunk_start + idx
+                        if not saw_array_start:
+                            if byte in b" \t\r\n":
+                                continue
+                            if byte != ord("["):
+                                raise ValueError(f"{data_file} must be a JSON array of objects.")
+                            saw_array_start = True
                             continue
-                        if byte != ord("["):
-                            raise ValueError(f"{data_file} must be a JSON array of objects.")
-                        saw_array_start = True
-                        continue
 
-                    if brace_depth == 0:
-                        if byte in b" \t\r\n,":
-                            continue
-                        if byte == ord("]"):
-                            reached_array_end = True
-                            break
-                        if byte != ord("{"):
-                            raise ValueError(f"{data_file} must contain JSON objects at the top level.")
-                        object_start = absolute_pos
-                        brace_depth = 1
-                        in_string = False
-                        escape = False
-                        continue
-
-                    if in_string:
-                        if escape:
-                            escape = False
-                        elif byte == ord("\\"):
-                            escape = True
-                        elif byte == ord('"'):
-                            in_string = False
-                        continue
-
-                    if byte == ord('"'):
-                        in_string = True
-                    elif byte == ord("{"):
-                        brace_depth += 1
-                    elif byte == ord("}"):
-                        brace_depth -= 1
                         if brace_depth == 0:
-                            object_end = absolute_pos + 1
-                            record_count += 1
-                            if rng is not None:
-                                if len(self) < max_records:
-                                    self.offsets.extend([object_start, object_end])
-                                else:
-                                    sample_idx = rng.randrange(record_count)
-                                    if sample_idx < max_records:
-                                        self.offsets[2 * sample_idx] = object_start
-                                        self.offsets[2 * sample_idx + 1] = object_end
-                            else:
-                                self.offsets.extend([object_start, object_end])
-                                if max_records is not None and len(self) >= max_records:
-                                    break
+                            if byte in b" \t\r\n,":
+                                continue
+                            if byte == ord("]"):
+                                reached_array_end = True
+                                break
+                            if byte != ord("{"):
+                                raise ValueError(f"{data_file} must contain JSON objects at the top level.")
+                            object_start = absolute_pos
+                            brace_depth = 1
+                            in_string = False
+                            escape = False
+                            continue
 
-                if max_records is not None and rng is None and len(self) >= max_records:
-                    break
-                if reached_array_end:
-                    break
+                        if in_string:
+                            if escape:
+                                escape = False
+                            elif byte == ord("\\"):
+                                escape = True
+                            elif byte == ord('"'):
+                                in_string = False
+                            continue
+
+                        if byte == ord('"'):
+                            in_string = True
+                        elif byte == ord("{"):
+                            brace_depth += 1
+                        elif byte == ord("}"):
+                            brace_depth -= 1
+                            if brace_depth == 0:
+                                object_end = absolute_pos + 1
+                                record_count += 1
+                                if rng is not None:
+                                    if len(self) < max_records:
+                                        self.offsets.extend([object_start, object_end])
+                                    else:
+                                        sample_idx = rng.randrange(record_count)
+                                        if sample_idx < max_records:
+                                            self.offsets[2 * sample_idx] = object_start
+                                            self.offsets[2 * sample_idx + 1] = object_end
+                                else:
+                                    self.offsets.extend([object_start, object_end])
+                                    if max_records is not None and len(self) >= max_records:
+                                        break
+
+                    if max_records is not None and rng is None and len(self) >= max_records:
+                        break
+                    if reached_array_end:
+                        break
+        finally:
+            if build_lock is not None:
+                build_lock.release()
 
         if not saw_array_start:
             raise ValueError(f"{data_file} must be a JSON array of objects.")
@@ -306,6 +509,9 @@ class JsonArrayOffsetStore:
             with open(tmp_index_file, "wb") as f:
                 self.offsets.tofile(f)
             os.replace(tmp_index_file, index_file)
+            meta = build_index_meta(data_file, "json_array", max_records, sample_seed, len(self))
+            meta["index_file"] = index_file
+            write_index_meta(index_file, meta)
 
     def __len__(self):
         return len(self.offsets) // 2
@@ -346,37 +552,55 @@ class JsonlOffsetStore:
         self._fp = None
         self.index_file = index_file
 
-        if index_file is not None and os.path.exists(index_file):
-            with open(index_file, "rb") as f:
-                self.offsets.fromfile(f, os.path.getsize(index_file) // self.offsets.itemsize)
-            if max_records is not None and len(self.offsets) != max_records:
-                raise ValueError(
-                    f"Index file {index_file} has {len(self.offsets)} records, expected {max_records}."
-                )
+        if load_existing_offsets_if_valid(
+            index_file,
+            data_file,
+            self.offsets,
+            max_records,
+            sample_seed,
+            items_per_record=1,
+        ):
             return
 
         rng = random.Random(sample_seed) if sample_seed is not None else None
         record_count = 0
 
-        with open(data_file, "rb") as f:
-            while True:
-                offset = f.tell()
-                line = f.readline()
-                if not line:
-                    break
-                if line.strip():
-                    record_count += 1
-                    if rng is not None and max_records is not None:
-                        if len(self.offsets) < max_records:
-                            self.offsets.append(offset)
-                        else:
-                            sample_idx = rng.randrange(record_count)
-                            if sample_idx < max_records:
-                                self.offsets[sample_idx] = offset
-                    else:
-                        self.offsets.append(offset)
-                    if rng is None and max_records is not None and len(self.offsets) >= max_records:
+        build_lock = None if index_file is None else IndexBuildLock(index_file, data_file, max_records, sample_seed, 1)
+        try:
+            if build_lock is not None:
+                build_lock.acquire()
+                if load_existing_offsets_if_valid(
+                    index_file,
+                    data_file,
+                    self.offsets,
+                    max_records,
+                    sample_seed,
+                    items_per_record=1,
+                ):
+                    return
+
+            with open(data_file, "rb") as f:
+                while True:
+                    offset = f.tell()
+                    line = f.readline()
+                    if not line:
                         break
+                    if line.strip():
+                        record_count += 1
+                        if rng is not None and max_records is not None:
+                            if len(self.offsets) < max_records:
+                                self.offsets.append(offset)
+                            else:
+                                sample_idx = rng.randrange(record_count)
+                                if sample_idx < max_records:
+                                    self.offsets[sample_idx] = offset
+                        else:
+                            self.offsets.append(offset)
+                        if rng is None and max_records is not None and len(self.offsets) >= max_records:
+                            break
+        finally:
+            if build_lock is not None:
+                build_lock.release()
 
         if sample_seed is not None and max_records is not None:
             if max_records > record_count:
@@ -392,6 +616,9 @@ class JsonlOffsetStore:
             with open(tmp_index_file, "wb") as f:
                 self.offsets.tofile(f)
             os.replace(tmp_index_file, index_file)
+            meta = build_index_meta(data_file, "jsonl", max_records, sample_seed, len(self.offsets))
+            meta["index_file"] = index_file
+            write_index_meta(index_file, meta)
 
     def __len__(self):
         return len(self.offsets)
@@ -472,15 +699,24 @@ def build_data_store(
     max_records: Optional[int] = None,
     sample_seed: Optional[int] = None,
     index_file: Optional[str] = None,
+    index_cache_root: Optional[str] = None,
 ):
     data_path = os.path.abspath(data_path)
+    resolved_index_file = index_file
+    if resolved_index_file is None:
+        resolved_index_file = make_auto_index_path(
+            data_path,
+            index_cache_root,
+            max_records=max_records,
+            sample_seed=sample_seed,
+        )
 
     if data_path.endswith(".jsonl"):
         return JsonlOffsetStore(
             data_path,
             max_records=max_records,
             sample_seed=sample_seed,
-            index_file=index_file,
+            index_file=resolved_index_file,
         )
 
     if data_path.endswith(".json"):
@@ -488,7 +724,7 @@ def build_data_store(
             data_path,
             max_records=max_records,
             sample_seed=sample_seed,
-            index_file=index_file,
+            index_file=resolved_index_file,
         )
 
     if data_path.endswith(".txt"):
@@ -505,15 +741,26 @@ def build_data_store(
                         max_records=json_limit,
                         sample_seed=json_sample_seed,
                         index_file=json_index_file,
+                        index_cache_root=index_cache_root,
                     )
                 )
         return ConcatStore(stores)
 
     stores = []
     for json_file in sorted(glob.glob(os.path.join(data_path, "*.json"))):
-        stores.append(JsonArrayOffsetStore(json_file))
+        stores.append(
+            JsonArrayOffsetStore(
+                json_file,
+                index_file=make_auto_index_path(json_file, index_cache_root),
+            )
+        )
     for jsonl_file in sorted(glob.glob(os.path.join(data_path, "*.jsonl"))):
-        stores.append(JsonlOffsetStore(jsonl_file))
+        stores.append(
+            JsonlOffsetStore(
+                jsonl_file,
+                index_file=make_auto_index_path(jsonl_file, index_cache_root),
+            )
+        )
     return ConcatStore(stores)
 
 
@@ -526,11 +773,11 @@ class LazySupervisedBboxDataset(Dataset):
                  img_preprocess=None,tokenizer=None):
         super(LazySupervisedBboxDataset, self).__init__()
 
-        data_store = build_data_store(data_path)
+        data_store = build_data_store(data_path, index_cache_root=data_args.index_cache_root)
         self.en_data_length = len(data_store)
 
         if data_args.cn_pair_root is not None:
-            cn_data_store = build_data_store(data_args.cn_pair_root)
+            cn_data_store = build_data_store(data_args.cn_pair_root, index_cache_root=data_args.index_cache_root)
             data_store = ConcatStore([data_store, cn_data_store])
 
         self.all_data_length = len(data_store)

@@ -7,6 +7,12 @@ export NCCL_IB_DISABLE="${NCCL_IB_DISABLE:-0}"
 export NCCL_DEBUG="${NCCL_DEBUG:-WARN}"
 export PYTHONFAULTHANDLER="${PYTHONFAULTHANDLER:-1}"
 
+# CPU launcher mode:
+# Run this script ONCE on the CPU/control node. DeepSpeed will SSH into
+# the GPU nodes listed in HOSTFILE and launch worker processes there.
+export PDSH_RCMD_TYPE="${PDSH_RCMD_TYPE:-ssh}"
+export PDSH_SSH_ARGS_APPEND="${PDSH_SSH_ARGS_APPEND:--i /gemini/space/gjx/utils/id_rsa -o IdentitiesOnly=yes -o StrictHostKeyChecking=no}"
+
 if [[ -n "${NCCL_IB_GID_INDEX:-}" ]]; then
   export NCCL_IB_GID_INDEX
 fi
@@ -17,7 +23,8 @@ fi
 
 ROOT="${ROOT:-/gemini/space/gjx/FG-CLIP}"
 MODEL_DIR="${MODEL_DIR:-$ROOT/siglip2-so400m-patch16-naflex}"
-PYTHON_BIN="${PYTHON_BIN:-python3}"
+PYTHON_BIN="${PYTHON_BIN:-/gemini/space/gjx/miniconda3/envs/fgclip_clean/bin/python}"
+DEEPSPEED_BIN="${DEEPSPEED_BIN:-/gemini/space/gjx/miniconda3/envs/fgclip_clean/bin/deepspeed}"
 
 COYO_SOURCE="${COYO_SOURCE:-/gemini/space/datasets/TeleMM-Data/cleaned/pretrain/Caption/coyo/coyo_balanced_recaptioned_397B_27B_0421.jsonl}"
 LLAVA_SOURCE="${LLAVA_SOURCE:-/gemini/space/datasets/TeleMM-Data/cleaned/pretrain/Caption/pt_llava-ov-mid-v1.jsonl}"
@@ -32,12 +39,11 @@ ZERO_IMAGE_ROOT="${ZERO_IMAGE_ROOT:-/gemini/space/datasets/TeleMM-Data/raw/pretr
 DATA_WORK_DIR="${DATA_WORK_DIR:-$ROOT/data/TeleMM}"
 DATA_PATH="${DATA_PATH:-$DATA_WORK_DIR/stage1_longonly_multisource_manifest.txt}"
 INDEX_CACHE_ROOT="${INDEX_CACHE_ROOT:-$ROOT/data/index_cache}"
-LOG_DIR="${LOG_DIR:-$ROOT/output/stage1_fgclip2_longonly_multisource}"
-HOSTFILE="${HOSTFILE:-$ROOT/hostfile}"
+LOG_DIR="${LOG_DIR:-$ROOT/output/stage1_from_siglip2_machine4_so_302M_w_longcaption}"
+HOSTFILE="${HOSTFILE:-/gemini/space/gjx/utils/hostfile}"
 
-MASTER_ADDR="${MASTER_ADDR:-10.233.72.172}"
+MASTER_ADDR="${MASTER_ADDR:-}"
 MASTER_PORT="${MASTER_PORT:-29500}"
-NODE_RANK="${NODE_RANK:-0}"
 NUM_NODES="${NUM_NODES:-4}"
 NUM_GPUS_PER_NODE="${NUM_GPUS_PER_NODE:-8}"
 TRAIN_WORLD_SIZE="${TRAIN_WORLD_SIZE:-$((NUM_NODES * NUM_GPUS_PER_NODE))}"
@@ -56,6 +62,7 @@ DATALOADER_NUM_WORKERS="${DATALOADER_NUM_WORKERS:-4}"
 TRAIN_SEED="${TRAIN_SEED:-20260506}"
 DATA_SEED="${DATA_SEED:-20260506}"
 FULL_DETERMINISM="${FULL_DETERMINISM:-False}"
+SAVE_STEPS="${SAVE_STEPS:-800}"
 
 COYO_RECORD_LIMIT="${COYO_RECORD_LIMIT:-}"
 COYO_SAMPLE_SEED="${COYO_SAMPLE_SEED:-20260506}"
@@ -69,18 +76,16 @@ DENSEFUSION_RECORD_LIMIT="${DENSEFUSION_RECORD_LIMIT:-}"
 DENSEFUSION_SAMPLE_SEED="${DENSEFUSION_SAMPLE_SEED:-20260506}"
 DENSEFUSION_INDEX_PATH="${DENSEFUSION_INDEX_PATH:-$DATA_WORK_DIR/densefusion_random${DENSEFUSION_RECORD_LIMIT:-all}_seed${DENSEFUSION_SAMPLE_SEED}.idx}"
 
-if ! [[ "$NODE_RANK" =~ ^[0-9]+$ ]]; then
-  echo "NODE_RANK must be a non-negative integer, got: $NODE_RANK" >&2
-  exit 1
-fi
-
-if (( NODE_RANK >= NUM_NODES )); then
-  echo "NODE_RANK must be in [0, $((NUM_NODES - 1))], got: $NODE_RANK" >&2
-  exit 1
-fi
-
 if [[ ! -f "$HOSTFILE" ]]; then
   echo "Hostfile not found: $HOSTFILE" >&2
+  exit 1
+fi
+
+if [[ -z "$MASTER_ADDR" ]]; then
+  MASTER_ADDR="$(awk 'NF && $1 !~ /^#/ {print $1; exit}' "$HOSTFILE")"
+fi
+if [[ -z "$MASTER_ADDR" ]]; then
+  echo "MASTER_ADDR is empty and no valid IP was found in hostfile: $HOSTFILE" >&2
   exit 1
 fi
 
@@ -89,8 +94,8 @@ mkdir -p "$DATA_WORK_DIR"
 mkdir -p "$INDEX_CACHE_ROOT"
 cd "$ROOT"
 
-TRAIN_LOG="$LOG_DIR/train_node${NODE_RANK}_$(date +%Y%m%d_%H%M%S).log"
-CONFIG_SNAPSHOT="$LOG_DIR/run_config_node${NODE_RANK}.env"
+TRAIN_LOG="$LOG_DIR/train_launcher_$(date +%Y%m%d_%H%M%S).log"
+CONFIG_SNAPSHOT="$LOG_DIR/run_config_launcher.env"
 MANIFEST_SNAPSHOT="$LOG_DIR/$(basename "$DATA_PATH").snapshot.txt"
 SCRIPT_SNAPSHOT="$LOG_DIR/$(basename "$0").snapshot.sh"
 HOSTFILE_SNAPSHOT="$LOG_DIR/$(basename "$HOSTFILE").snapshot"
@@ -111,19 +116,11 @@ build_random_index_if_needed() {
     exit 1
   fi
 
-  local expected_bytes=$((limit * 8))
-  if [[ "$NODE_RANK" == "0" ]]; then
-    "$PYTHON_BIN" "$ROOT/scripts/build_jsonl_offset_index.py" \
-      --jsonl "$source" \
-      --output "$index_path" \
-      --sample-size "$limit" \
-      --seed "$seed"
-  else
-    echo "Waiting for random index: $index_path"
-    while [[ ! -f "$index_path" || "$(stat -c%s "$index_path" 2>/dev/null || echo 0)" != "$expected_bytes" ]]; do
-      sleep 10
-    done
-  fi
+  "$PYTHON_BIN" "$ROOT/scripts/build_jsonl_offset_index.py" \
+    --jsonl "$source" \
+    --output "$index_path" \
+    --sample-size "$limit" \
+    --seed "$seed"
 }
 
 append_manifest_line() {
@@ -157,10 +154,10 @@ append_manifest_line "$ZERO_SOURCE" "" "" ""
   printf "ROOT=%q\n" "$ROOT"
   printf "MODEL_DIR=%q\n" "$MODEL_DIR"
   printf "PYTHON_BIN=%q\n" "$PYTHON_BIN"
+  printf "DEEPSPEED_BIN=%q\n" "$DEEPSPEED_BIN"
   printf "HOSTFILE=%q\n" "$HOSTFILE"
   printf "MASTER_ADDR=%q\n" "$MASTER_ADDR"
   printf "MASTER_PORT=%q\n" "$MASTER_PORT"
-  printf "NODE_RANK=%q\n" "$NODE_RANK"
   printf "NUM_NODES=%q\n" "$NUM_NODES"
   printf "NUM_GPUS_PER_NODE=%q\n" "$NUM_GPUS_PER_NODE"
   printf "TRAIN_WORLD_SIZE=%q\n" "$TRAIN_WORLD_SIZE"
@@ -183,6 +180,7 @@ append_manifest_line "$ZERO_SOURCE" "" "" ""
   printf "TRAIN_SEED=%q\n" "$TRAIN_SEED"
   printf "DATA_SEED=%q\n" "$DATA_SEED"
   printf "FULL_DETERMINISM=%q\n" "$FULL_DETERMINISM"
+  printf "SAVE_STEPS=%q\n" "$SAVE_STEPS"
   printf "COYO_SOURCE=%q\n" "$COYO_SOURCE"
   printf "COYO_RECORD_LIMIT=%q\n" "$COYO_RECORD_LIMIT"
   printf "COYO_SAMPLE_SEED=%q\n" "$COYO_SAMPLE_SEED"
@@ -207,13 +205,11 @@ append_manifest_line "$ZERO_SOURCE" "" "" ""
   printf "TRAIN_LOG=%q\n" "$TRAIN_LOG"
 } > "$CONFIG_SNAPSHOT"
 
-if [[ "$NODE_RANK" == "0" ]]; then
-  cp "$0" "$SCRIPT_SNAPSHOT"
-  cp "$HOSTFILE" "$HOSTFILE_SNAPSHOT"
-  cp "$DATA_PATH" "$MANIFEST_SNAPSHOT"
-fi
+cp "$0" "$SCRIPT_SNAPSHOT"
+cp "$HOSTFILE" "$HOSTFILE_SNAPSHOT"
+cp "$DATA_PATH" "$MANIFEST_SNAPSHOT"
 
-echo "Starting distributed train with NODE_RANK=$NODE_RANK MASTER_ADDR=$MASTER_ADDR MASTER_PORT=$MASTER_PORT"
+echo "Starting distributed train from CPU launcher: MASTER_ADDR=$MASTER_ADDR MASTER_PORT=$MASTER_PORT"
 echo "NCCL_IB_DISABLE=$NCCL_IB_DISABLE NCCL_SOCKET_IFNAME=${NCCL_SOCKET_IFNAME:-unset} NCCL_IB_GID_INDEX=${NCCL_IB_GID_INDEX:-unset}"
 echo "TRAIN_WORLD_SIZE=$TRAIN_WORLD_SIZE MAX_NUM_PATCHES=$MAX_NUM_PATCHES PER_DEVICE_TRAIN_BATCH_SIZE=$PER_DEVICE_TRAIN_BATCH_SIZE"
 echo "DATA_PATH=$DATA_PATH"
@@ -223,25 +219,31 @@ echo "ZERO_IMAGE_ROOT=$ZERO_IMAGE_ROOT"
 echo "USE_SHORT_CAPTION=$USE_SHORT_CAPTION"
 echo "MAX_IMAGE_PIXELS=$MAX_IMAGE_PIXELS"
 echo "TRAIN_SEED=$TRAIN_SEED DATA_SEED=$DATA_SEED FULL_DETERMINISM=$FULL_DETERMINISM"
+echo "SAVE_STEPS=$SAVE_STEPS"
 echo "Config snapshot: $CONFIG_SNAPSHOT"
-if [[ "$NODE_RANK" == "0" ]]; then
-  echo "Script snapshot: $SCRIPT_SNAPSHOT"
-  echo "Hostfile snapshot: $HOSTFILE_SNAPSHOT"
-  echo "Manifest snapshot: $MANIFEST_SNAPSHOT"
-fi
+echo "Script snapshot: $SCRIPT_SNAPSHOT"
+echo "Hostfile snapshot: $HOSTFILE_SNAPSHOT"
+echo "Manifest snapshot: $MANIFEST_SNAPSHOT"
 echo "Training log: $TRAIN_LOG"
 echo "Manifest:"
 cat "$DATA_PATH"
 
-nvidia-smi \
-  --query-gpu=timestamp,index,utilization.gpu,utilization.memory,memory.used,memory.total,power.draw \
-  --format=csv,noheader,nounits \
-  -l 2 > "$LOG_DIR/gpu_usage_node${NODE_RANK}.csv" &
-MON_PID=$!
+MON_PID=""
+if command -v nvidia-smi >/dev/null 2>&1; then
+  nvidia-smi \
+    --query-gpu=timestamp,index,utilization.gpu,utilization.memory,memory.used,memory.total,power.draw \
+    --format=csv,noheader,nounits \
+    -l 2 > "$LOG_DIR/gpu_usage_launcher.csv" &
+  MON_PID=$!
+else
+  echo "CPU/control node has no nvidia-smi; skip local GPU monitor."
+fi
 
 cleanup() {
   status=$?
-  kill "$MON_PID" 2>/dev/null || true
+  if [[ -n "${MON_PID:-}" ]]; then
+    kill "$MON_PID" 2>/dev/null || true
+  fi
   echo "Finished at: $(date)"
   echo "Exit status: $status"
   echo "Training log: $TRAIN_LOG"
@@ -250,10 +252,8 @@ cleanup() {
 
 trap cleanup EXIT
 
-deepspeed \
+"$DEEPSPEED_BIN" \
   --hostfile "$HOSTFILE" \
-  --no_ssh \
-  --node_rank "$NODE_RANK" \
   --master_addr "$MASTER_ADDR" \
   --master_port "$MASTER_PORT" \
   --num_nodes "$NUM_NODES" \
@@ -266,8 +266,8 @@ deepspeed \
     --image_folder "$FINEHARD_IMAGE_ROOT" \
     --extra_image_folders "$ZERO_IMAGE_ROOT" \
     --index_cache_root "$INDEX_CACHE_ROOT" \
-    --missing_image_log_path "$LOG_DIR/missing_images_node${NODE_RANK}.jsonl" \
-    --large_image_log_path "$LOG_DIR/large_images_node${NODE_RANK}.jsonl" \
+    --missing_image_log_path "$LOG_DIR/missing_images.jsonl" \
+    --large_image_log_path "$LOG_DIR/large_images.jsonl" \
     --max_image_pixels "$MAX_IMAGE_PIXELS" \
     --cn_and_en_2_train False \
     --loss_type reduce \
@@ -289,7 +289,7 @@ deepspeed \
     --gradient_accumulation_steps "$GRADIENT_ACCUMULATION_STEPS" \
     --num_train_epochs "$NUM_TRAIN_EPOCHS" \
     --save_strategy "steps" \
-    --save_steps 358 \
+    --save_steps "$SAVE_STEPS" \
     --learning_rate 1e-6 \
     --weight_decay 0.001 \
     --adam_beta1 0.9 \
