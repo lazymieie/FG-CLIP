@@ -1048,7 +1048,7 @@ class LazySupervisedBboxDataset(Dataset):
                 )
                 continue
 
-            return item, caption, caption_short, is_cn, image, image_name
+            return cur_idx, item, caption, caption_short, is_cn, image, image_name
 
         raise RuntimeError("No readable image was found in the dataset.")
 
@@ -1067,7 +1067,7 @@ class LazySupervisedBboxDataset(Dataset):
     
     def __getitem__(self, i) -> Dict[str, torch.Tensor]:
 
-        item, caption, caption_short, is_cn, image, image_name = self.load_valid_item(i)
+        cur_idx, item, caption, caption_short, is_cn, image, image_name = self.load_valid_item(i)
         
 
         prewidth, preheight = image.size
