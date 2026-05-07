@@ -305,13 +305,19 @@ def load_existing_offsets_if_valid(
     if index_file is None or not os.path.exists(index_file):
         return False
 
-    meta = read_index_meta(index_file)
-    if not index_matches_source(meta, data_file, max_records, sample_seed):
-        return False
+    try:
+        meta = read_index_meta(index_file)
+        if not index_matches_source(meta, data_file, max_records, sample_seed):
+            return False
 
-    del offset_array[:]
-    with open(index_file, "rb") as f:
-        offset_array.fromfile(f, os.path.getsize(index_file) // offset_array.itemsize)
+        del offset_array[:]
+        index_size = os.path.getsize(index_file)
+        with open(index_file, "rb") as f:
+            offset_array.fromfile(f, index_size // offset_array.itemsize)
+    except FileNotFoundError:
+        # Another rank may be atomically replacing the index or meta file.
+        # Treat this as a cache miss and let the caller retry.
+        return False
 
     if len(offset_array) % items_per_record != 0:
         raise ValueError(f"Index file {index_file} is corrupted.")
