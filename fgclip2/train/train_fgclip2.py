@@ -112,8 +112,12 @@ def append_jsonl_record(log_path: Optional[str], record: dict) -> None:
     log_dir = os.path.dirname(log_path)
     if log_dir:
         os.makedirs(log_dir, exist_ok=True)
-    with open(log_path, "a", encoding="utf-8") as f:
-        f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    try:
+        with open(log_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except OSError as exc:
+        if exc.errno != 24:
+            raise
 
 
 def load_image_rgb(image_path: str):
@@ -590,11 +594,6 @@ class JsonArrayOffsetStore:
         state["_fp"] = None
         return state
 
-    def _file(self):
-        if self._fp is None:
-            self._fp = open(self.data_file, "rb")
-        return self._fp
-
     def __getitem__(self, index):
         if index < 0:
             index += len(self)
@@ -603,9 +602,10 @@ class JsonArrayOffsetStore:
 
         start = self.offsets[2 * index]
         end = self.offsets[2 * index + 1]
-        f = self._file()
-        f.seek(start)
-        return json.loads(f.read(end - start).decode("utf-8"))
+        with open(self.data_file, "rb") as f:
+            f.seek(start)
+            payload = f.read(end - start)
+        return json.loads(payload.decode("utf-8"))
 
 
 class JsonlOffsetStore:
@@ -696,20 +696,15 @@ class JsonlOffsetStore:
         state["_fp"] = None
         return state
 
-    def _file(self):
-        if self._fp is None:
-            self._fp = open(self.data_file, "rb")
-        return self._fp
-
     def __getitem__(self, index):
         if index < 0:
             index += len(self.offsets)
         if index < 0 or index >= len(self.offsets):
             raise IndexError(index)
 
-        f = self._file()
-        f.seek(self.offsets[index])
-        line = f.readline()
+        with open(self.data_file, "rb") as f:
+            f.seek(self.offsets[index])
+            line = f.readline()
         return json.loads(line.decode("utf-8"))
 
 

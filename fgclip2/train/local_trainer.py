@@ -395,6 +395,8 @@ class CLIPTrainer(Trainer):
             os.path.join(self.args.output_dir, "debug_exception_dumps"),
         )
         self.debug_dump_sample_limit = int(os.getenv("FGCLIP_DEBUG_SAMPLE_LIMIT", "8"))
+        self.debug_log_fd_count = os.getenv("FGCLIP_DEBUG_LOG_FD_COUNT", "0") == "1"
+        self.debug_fd_interval = max(int(os.getenv("FGCLIP_DEBUG_FD_INTERVAL", "10")), 1)
 
     def _get_rank(self) -> int:
         if dist.is_available() and dist.is_initialized():
@@ -420,6 +422,26 @@ class CLIPTrainer(Trainer):
         if isinstance(value, dict):
             return {k: self._summarize_value(v) for k, v in value.items()}
         return repr(value)
+
+    def _get_open_fd_count(self) -> Optional[int]:
+        fd_dir = "/proc/self/fd"
+        try:
+            return len(os.listdir(fd_dir))
+        except OSError:
+            return None
+
+    def _maybe_log_fd_count(self) -> None:
+        if not self.debug_log_fd_count:
+            return
+        next_step = self.state.global_step + 1
+        if next_step % self.debug_fd_interval != 0:
+            return
+        fd_count = self._get_open_fd_count()
+        rank = self._get_rank()
+        print(
+            f"[rank={rank}] fd_count step={next_step} pid={os.getpid()} open_fds={fd_count}",
+            flush=True,
+        )
 
     def _dump_debug_batch(self, inputs, exc: Exception) -> Optional[str]:
         if not self.debug_dump_on_exception:
@@ -474,6 +496,7 @@ class CLIPTrainer(Trainer):
 
     def training_step(self, model: nn.Module, inputs: Dict[str, Union[torch.Tensor, Any]], *args, **kwargs) -> torch.Tensor:
         try:
+            self._maybe_log_fd_count()
             return super().training_step(model, inputs, *args, **kwargs)
         except Exception as exc:
             self._handle_training_exception(inputs, exc)
