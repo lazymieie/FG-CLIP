@@ -370,8 +370,11 @@ class IndexBuildLock:
                 time.sleep(AUTO_INDEX_LOCK_POLL_SECONDS)
 
     def release(self) -> None:
-        if self.acquired and os.path.exists(self.lock_file):
-            os.remove(self.lock_file)
+        if self.acquired:
+            try:
+                os.remove(self.lock_file)
+            except FileNotFoundError:
+                pass
         self.acquired = False
 
 
@@ -488,30 +491,29 @@ class JsonArrayOffsetStore:
                         break
                     if reached_array_end:
                         break
+            if not saw_array_start:
+                raise ValueError(f"{data_file} must be a JSON array of objects.")
+            if brace_depth != 0 or in_string:
+                raise ValueError(f"{data_file} is not a valid JSON array of objects.")
+            if rng is not None and max_records > record_count:
+                raise ValueError(
+                    f"Cannot sample {max_records} records from {data_file}; only {record_count} records found."
+                )
+
+            if index_file is not None:
+                index_dir = os.path.dirname(index_file)
+                if index_dir:
+                    os.makedirs(index_dir, exist_ok=True)
+                tmp_index_file = f"{index_file}.tmp.{os.getpid()}"
+                with open(tmp_index_file, "wb") as f:
+                    self.offsets.tofile(f)
+                os.replace(tmp_index_file, index_file)
+                meta = build_index_meta(data_file, "json_array", max_records, sample_seed, len(self))
+                meta["index_file"] = index_file
+                write_index_meta(index_file, meta)
         finally:
             if build_lock is not None:
                 build_lock.release()
-
-        if not saw_array_start:
-            raise ValueError(f"{data_file} must be a JSON array of objects.")
-        if brace_depth != 0 or in_string:
-            raise ValueError(f"{data_file} is not a valid JSON array of objects.")
-        if rng is not None and max_records > record_count:
-            raise ValueError(
-                f"Cannot sample {max_records} records from {data_file}; only {record_count} records found."
-            )
-
-        if index_file is not None:
-            index_dir = os.path.dirname(index_file)
-            if index_dir:
-                os.makedirs(index_dir, exist_ok=True)
-            tmp_index_file = f"{index_file}.tmp.{os.getpid()}"
-            with open(tmp_index_file, "wb") as f:
-                self.offsets.tofile(f)
-            os.replace(tmp_index_file, index_file)
-            meta = build_index_meta(data_file, "json_array", max_records, sample_seed, len(self))
-            meta["index_file"] = index_file
-            write_index_meta(index_file, meta)
 
     def __len__(self):
         return len(self.offsets) // 2
@@ -598,27 +600,26 @@ class JsonlOffsetStore:
                             self.offsets.append(offset)
                         if rng is None and max_records is not None and len(self.offsets) >= max_records:
                             break
+            if sample_seed is not None and max_records is not None:
+                if max_records > record_count:
+                    raise ValueError(
+                        f"Cannot sample {max_records} records from {self.data_file}; only {record_count} records found."
+                    )
+
+            if index_file is not None:
+                index_dir = os.path.dirname(index_file)
+                if index_dir:
+                    os.makedirs(index_dir, exist_ok=True)
+                tmp_index_file = f"{index_file}.tmp.{os.getpid()}"
+                with open(tmp_index_file, "wb") as f:
+                    self.offsets.tofile(f)
+                os.replace(tmp_index_file, index_file)
+                meta = build_index_meta(data_file, "jsonl", max_records, sample_seed, len(self.offsets))
+                meta["index_file"] = index_file
+                write_index_meta(index_file, meta)
         finally:
             if build_lock is not None:
                 build_lock.release()
-
-        if sample_seed is not None and max_records is not None:
-            if max_records > record_count:
-                raise ValueError(
-                    f"Cannot sample {max_records} records from {self.data_file}; only {record_count} records found."
-                )
-
-        if index_file is not None:
-            index_dir = os.path.dirname(index_file)
-            if index_dir:
-                os.makedirs(index_dir, exist_ok=True)
-            tmp_index_file = f"{index_file}.tmp.{os.getpid()}"
-            with open(tmp_index_file, "wb") as f:
-                self.offsets.tofile(f)
-            os.replace(tmp_index_file, index_file)
-            meta = build_index_meta(data_file, "jsonl", max_records, sample_seed, len(self.offsets))
-            meta["index_file"] = index_file
-            write_index_meta(index_file, meta)
 
     def __len__(self):
         return len(self.offsets)
