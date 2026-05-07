@@ -345,4 +345,5 @@ deepspeed \
     --dataloader_num_workers "$DATALOADER_NUM_WORKERS" \
     --dataloader_pin_memory "$DATALOADER_PIN_MEMORY" \
     --lazy_preprocess True \
-    --report_to "$REPORT_TO"
+    --bad_sample_log_path "$LOG_DIR/bad_samples_node${NODE_RANK}.jsonl" \
+    --report_to "tensorboard"
