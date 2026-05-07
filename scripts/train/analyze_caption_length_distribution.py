@@ -359,11 +359,6 @@ class JsonArrayOffsetStore:
     def __len__(self) -> int:
         return len(self.offsets) // 2
 
-    def _file(self):
-        if self._fp is None:
-            self._fp = open(self.data_file, "rb")
-        return self._fp
-
     def __getitem__(self, index: int):
         if index < 0:
             index += len(self)
@@ -372,9 +367,10 @@ class JsonArrayOffsetStore:
 
         start = self.offsets[2 * index]
         end = self.offsets[2 * index + 1]
-        f = self._file()
-        f.seek(start)
-        return json.loads(f.read(end - start).decode("utf-8"))
+        with open(self.data_file, "rb") as f:
+            f.seek(start)
+            payload = f.read(end - start)
+        return json.loads(payload.decode("utf-8"))
 
 
 class JsonlOffsetStore:
@@ -440,20 +436,15 @@ class JsonlOffsetStore:
     def __len__(self) -> int:
         return len(self.offsets)
 
-    def _file(self):
-        if self._fp is None:
-            self._fp = open(self.data_file, "rb")
-        return self._fp
-
     def __getitem__(self, index: int):
         if index < 0:
             index += len(self.offsets)
         if index < 0 or index >= len(self.offsets):
             raise IndexError(index)
 
-        f = self._file()
-        f.seek(self.offsets[index])
-        line = f.readline()
+        with open(self.data_file, "rb") as f:
+            f.seek(self.offsets[index])
+            line = f.readline()
         return json.loads(line.decode("utf-8"))
 
 
