@@ -5,13 +5,14 @@ import argparse
 import glob
 import hashlib
 import json
+import multiprocessing as mp
 import os
 import re
 import sys
 import time
 from array import array
 from bisect import bisect_right
-from collections import Counter
+from collections import Counter, OrderedDict
 from dataclasses import dataclass
 from typing import Optional
 
@@ -32,6 +33,14 @@ SHELL_VAR_RE = re.compile(r"\$\{([A-Z0-9_]+)(:-([^}]*))?\}|\$([A-Z0-9_]+)")
 APPEND_MANIFEST_RE = re.compile(
     r'^append_manifest_line\s+"(?P<source>[^"]+)"\s+"(?P<limit>[^"]*)"\s+"(?P<seed>[^"]*)"\s+"(?P<index>[^"]*)"$'
 )
+WORKER_STORE = None
+WORKER_TOKENIZER = None
+WORKER_NORMALIZE_LOWERCASE = True
+WORKER_STRIP_IMAGE_TOKEN = True
+WORKER_MAX_SEQ_LENGTH = 196
+WORKER_BATCH_SIZE = 512
+FILE_HANDLE_CACHE = None
+FILE_HANDLE_CACHE_LIMIT = 32
 
 
 def parse_args() -> argparse.Namespace:
@@ -71,6 +80,24 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=512,
         help="Batch size for tokenizer calls.",
+    )
+    parser.add_argument(
+        "--num-workers",
+        type=int,
+        default=1,
+        help="Number of worker processes per source. Default: 1.",
+    )
+    parser.add_argument(
+        "--chunk-size",
+        type=int,
+        default=50000,
+        help="Number of samples per worker task chunk when --num-workers > 1.",
+    )
+    parser.add_argument(
+        "--max-open-files-per-worker",
+        type=int,
+        default=32,
+        help="Per-process LRU cap for open dataset files. Default: 32.",
     )
     parser.add_argument(
         "--max-samples-per-source",
@@ -147,6 +174,63 @@ def build_progress(
         leave=True,
         smoothing=0.05,
     )
+
+
+class FileHandleCache:
+    def __init__(self, max_open_files: int):
+        self.max_open_files = max_open_files
+        self._handles: OrderedDict[str, object] = OrderedDict()
+
+    def get(self, path: str):
+        handle = self._handles.pop(path, None)
+        if handle is not None and not handle.closed:
+            self._handles[path] = handle
+            return handle
+
+        if handle is not None:
+            try:
+                handle.close()
+            except Exception:
+                pass
+
+        while len(self._handles) >= self.max_open_files:
+            _old_path, old_handle = self._handles.popitem(last=False)
+            try:
+                old_handle.close()
+            except Exception:
+                pass
+
+        handle = open(path, "rb")
+        self._handles[path] = handle
+        return handle
+
+    def close_all(self) -> None:
+        while self._handles:
+            _path, handle = self._handles.popitem(last=False)
+            try:
+                handle.close()
+            except Exception:
+                pass
+
+
+def configure_file_handle_cache(max_open_files: int) -> None:
+    global FILE_HANDLE_CACHE
+    global FILE_HANDLE_CACHE_LIMIT
+
+    if max_open_files <= 0:
+        raise ValueError("max_open_files must be >= 1")
+
+    FILE_HANDLE_CACHE_LIMIT = max_open_files
+    if FILE_HANDLE_CACHE is not None:
+        FILE_HANDLE_CACHE.close_all()
+    FILE_HANDLE_CACHE = FileHandleCache(max_open_files)
+
+
+def get_cached_file_handle(path: str):
+    global FILE_HANDLE_CACHE
+    if FILE_HANDLE_CACHE is None:
+        FILE_HANDLE_CACHE = FileHandleCache(FILE_HANDLE_CACHE_LIMIT)
+    return FILE_HANDLE_CACHE.get(path)
 
 
 def index_meta_path(index_file: str) -> str:
@@ -387,6 +471,14 @@ class JsonArrayOffsetStore:
     def __len__(self) -> int:
         return len(self.offsets) // 2
 
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        state["_fp"] = None
+        return state
+
+    def _file(self):
+        return get_cached_file_handle(self.data_file)
+
     def __getitem__(self, index: int):
         if index < 0:
             index += len(self)
@@ -395,9 +487,9 @@ class JsonArrayOffsetStore:
 
         start = self.offsets[2 * index]
         end = self.offsets[2 * index + 1]
-        with open(self.data_file, "rb") as f:
-            f.seek(start)
-            payload = f.read(end - start)
+        f = self._file()
+        f.seek(start)
+        payload = f.read(end - start)
         return json.loads(payload.decode("utf-8"))
 
 
@@ -464,15 +556,23 @@ class JsonlOffsetStore:
     def __len__(self) -> int:
         return len(self.offsets)
 
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        state["_fp"] = None
+        return state
+
+    def _file(self):
+        return get_cached_file_handle(self.data_file)
+
     def __getitem__(self, index: int):
         if index < 0:
             index += len(self.offsets)
         if index < 0 or index >= len(self.offsets):
             raise IndexError(index)
 
-        with open(self.data_file, "rb") as f:
-            f.seek(self.offsets[index])
-            line = f.readline()
+        f = self._file()
+        f.seek(self.offsets[index])
+        line = f.readline()
         return json.loads(line.decode("utf-8"))
 
 
@@ -724,6 +824,13 @@ class LengthAccumulator:
         return result
 
 
+def supports_fork_multiprocessing() -> bool:
+    try:
+        return "fork" in mp.get_all_start_methods()
+    except Exception:
+        return False
+
+
 def flush_token_batch(
     captions: list[str],
     tokenizer,
@@ -745,12 +852,80 @@ def flush_token_batch(
     captions.clear()
 
 
-def analyze_source(
+def build_source_payload(
     source: SourceSpec,
+    store_length: int,
+    accumulator: LengthAccumulator,
+    args: argparse.Namespace,
+) -> dict:
+    payload = accumulator.finalize(
+        max_seq_length=args.max_seq_length,
+        include_full_histogram=args.include_full_histogram,
+        top_errors=args.top_errors,
+    )
+    payload["label"] = source.label
+    payload["data_path"] = os.path.abspath(source.data_path)
+    payload["num_records_available"] = store_length
+    payload["max_records"] = source.max_records
+    payload["sample_seed"] = source.sample_seed
+    payload["index_file"] = source.index_file
+    payload["origin"] = source.origin
+    return payload
+
+
+def init_worker(
+    lowercase: bool,
+    strip_image_token: bool,
+    max_seq_length: int,
+    batch_size: int,
+    max_open_files_per_worker: int,
+) -> None:
+    global WORKER_NORMALIZE_LOWERCASE
+    global WORKER_STRIP_IMAGE_TOKEN
+    global WORKER_MAX_SEQ_LENGTH
+    global WORKER_BATCH_SIZE
+    WORKER_NORMALIZE_LOWERCASE = lowercase
+    WORKER_STRIP_IMAGE_TOKEN = strip_image_token
+    WORKER_MAX_SEQ_LENGTH = max_seq_length
+    WORKER_BATCH_SIZE = batch_size
+    os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+    configure_file_handle_cache(max_open_files_per_worker)
+
+
+def process_range(task: tuple[int, int]) -> tuple[int, LengthAccumulator]:
+    start, end = task
+    accumulator = LengthAccumulator()
+    token_batch: list[str] = []
+
+    for idx in range(start, end):
+        try:
+            item = WORKER_STORE[idx]
+            caption = get_caption(item)
+            normalized = normalize_caption(
+                caption,
+                lowercase=WORKER_NORMALIZE_LOWERCASE,
+                strip_image_token=WORKER_STRIP_IMAGE_TOKEN,
+            )
+            accumulator.add_raw(len(normalized))
+            if WORKER_TOKENIZER is not None:
+                token_batch.append(normalized)
+                if len(token_batch) >= WORKER_BATCH_SIZE:
+                    flush_token_batch(token_batch, WORKER_TOKENIZER, accumulator, WORKER_MAX_SEQ_LENGTH)
+        except Exception as exc:
+            accumulator.add_error(exc)
+
+    if WORKER_TOKENIZER is not None:
+        flush_token_batch(token_batch, WORKER_TOKENIZER, accumulator, WORKER_MAX_SEQ_LENGTH)
+
+    return end - start, accumulator
+
+
+def analyze_source_single_process(
+    source: SourceSpec,
+    store,
     tokenizer,
     args: argparse.Namespace,
 ) -> tuple[dict, LengthAccumulator]:
-    store = build_store_for_spec(source, args.index_cache_root)
     accumulator = LengthAccumulator()
     token_batch: list[str] = []
 
@@ -798,19 +973,107 @@ def analyze_source(
             )
             progress.close()
 
-    payload = accumulator.finalize(
-        max_seq_length=args.max_seq_length,
-        include_full_histogram=args.include_full_histogram,
-        top_errors=args.top_errors,
-    )
-    payload["label"] = source.label
-    payload["data_path"] = os.path.abspath(source.data_path)
-    payload["num_records_available"] = len(store)
-    payload["max_records"] = source.max_records
-    payload["sample_seed"] = source.sample_seed
-    payload["index_file"] = source.index_file
-    payload["origin"] = source.origin
+    payload = build_source_payload(source, len(store), accumulator, args)
     return payload, accumulator
+
+
+def analyze_source_multi_process(
+    source: SourceSpec,
+    store,
+    tokenizer,
+    args: argparse.Namespace,
+) -> tuple[dict, LengthAccumulator]:
+    global WORKER_STORE
+    global WORKER_TOKENIZER
+
+    num_to_process = len(store)
+    if args.max_samples_per_source is not None:
+        num_to_process = min(num_to_process, args.max_samples_per_source)
+
+    if num_to_process == 0:
+        empty = LengthAccumulator()
+        return build_source_payload(source, len(store), empty, args), empty
+
+    worker_count = min(args.num_workers, num_to_process)
+    chunk_size = min(args.chunk_size, num_to_process)
+    tasks = [
+        (start, min(start + chunk_size, num_to_process))
+        for start in range(0, num_to_process, chunk_size)
+    ]
+
+    ctx = mp.get_context("fork")
+    WORKER_STORE = store
+    WORKER_TOKENIZER = tokenizer
+    accumulator = LengthAccumulator()
+    progress = build_progress(num_to_process, source.label, args.no_progress_bar)
+    processed_so_far = 0
+    start_time = time.perf_counter()
+
+    try:
+        with ctx.Pool(
+            processes=worker_count,
+            initializer=init_worker,
+            initargs=(
+                not args.no_lowercase,
+                not args.keep_image_token,
+                args.max_seq_length,
+                args.batch_size,
+                args.max_open_files_per_worker,
+            ),
+        ) as pool:
+            for processed_count, partial_accumulator in pool.imap_unordered(process_range, tasks, chunksize=1):
+                accumulator.merge(partial_accumulator)
+                processed_so_far += processed_count
+
+                if progress is not None:
+                    progress.update(processed_count)
+                    elapsed = time.perf_counter() - start_time
+                    rate = processed_so_far / elapsed if elapsed > 0 else 0.0
+                    progress.set_postfix(
+                        skipped=accumulator.skipped_count,
+                        rate=f"{rate:.1f}/s",
+                    )
+                elif args.progress_every and processed_so_far % args.progress_every < processed_count:
+                    elapsed = time.perf_counter() - start_time
+                    rate = processed_so_far / elapsed if elapsed > 0 else 0.0
+                    eprint(
+                        f"[{source.label}] analyzed {processed_so_far}/{num_to_process} samples "
+                        f"({rate:.1f} samples/s, workers={worker_count})"
+                    )
+    finally:
+        WORKER_STORE = None
+        WORKER_TOKENIZER = None
+        if progress is not None:
+            elapsed = time.perf_counter() - start_time
+            rate = accumulator.sample_count / elapsed if elapsed > 0 else 0.0
+            progress.set_postfix(
+                samples=accumulator.sample_count,
+                skipped=accumulator.skipped_count,
+                rate=f"{rate:.1f}/s",
+            )
+            progress.close()
+
+    payload = build_source_payload(source, len(store), accumulator, args)
+    payload["num_workers"] = worker_count
+    payload["chunk_size"] = chunk_size
+    return payload, accumulator
+
+
+def analyze_source(
+    source: SourceSpec,
+    tokenizer,
+    args: argparse.Namespace,
+) -> tuple[dict, LengthAccumulator]:
+    store = build_store_for_spec(source, args.index_cache_root)
+    if args.num_workers <= 1:
+        return analyze_source_single_process(source, store, tokenizer, args)
+    if not supports_fork_multiprocessing():
+        eprint(
+            f"Fork-based multiprocessing is not available in this environment; "
+            f"falling back to single-process mode for {source.label}."
+        )
+        return analyze_source_single_process(source, store, tokenizer, args)
+    return analyze_source_multi_process(source, store, tokenizer, args)
 
 
 def resolve_shell_expr(expr: str, values: dict[str, str]) -> str:
@@ -980,8 +1243,18 @@ def main() -> None:
 
     if args.batch_size <= 0:
         raise ValueError("--batch-size must be >= 1")
+    if args.num_workers <= 0:
+        raise ValueError("--num-workers must be >= 1")
+    if args.chunk_size <= 0:
+        raise ValueError("--chunk-size must be >= 1")
+    if args.max_open_files_per_worker <= 0:
+        raise ValueError("--max-open-files-per-worker must be >= 1")
     if args.max_seq_length <= 0:
         raise ValueError("--max-seq-length must be >= 1")
+
+    if args.num_workers > 1:
+        os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+    configure_file_handle_cache(args.max_open_files_per_worker)
 
     script_vars = {}
     if args.train_script:
