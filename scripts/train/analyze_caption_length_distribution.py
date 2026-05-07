@@ -8,6 +8,7 @@ import json
 import os
 import re
 import sys
+import time
 from array import array
 from bisect import bisect_right
 from collections import Counter
@@ -18,6 +19,11 @@ try:
     from transformers import AutoTokenizer
 except ImportError:  # pragma: no cover
     AutoTokenizer = None
+
+try:
+    from tqdm.auto import tqdm
+except ImportError:  # pragma: no cover
+    tqdm = None
 
 
 IMAGE_TOKEN_PATTERN = re.compile(r"<image>")
@@ -79,6 +85,11 @@ def parse_args() -> argparse.Namespace:
         help="Print progress to stderr every N analyzed samples per source. Set 0 to disable.",
     )
     parser.add_argument(
+        "--no-progress-bar",
+        action="store_true",
+        help="Disable tqdm progress bars and use periodic text logging only.",
+    )
+    parser.add_argument(
         "--output",
         default=None,
         help="Optional JSON output path. Default: print JSON to stdout only.",
@@ -119,6 +130,23 @@ class SourceSpec:
 
 def eprint(*args) -> None:
     print(*args, file=sys.stderr)
+
+
+def build_progress(
+    total: int,
+    source_label: str,
+    disable_progress_bar: bool,
+):
+    if disable_progress_bar or tqdm is None:
+        return None
+    return tqdm(
+        total=total,
+        desc=source_label,
+        unit="samples",
+        dynamic_ncols=True,
+        leave=True,
+        smoothing=0.05,
+    )
 
 
 def index_meta_path(index_file: str) -> str:
@@ -730,28 +758,45 @@ def analyze_source(
     if args.max_samples_per_source is not None:
         num_to_process = min(num_to_process, args.max_samples_per_source)
 
-    for idx in range(num_to_process):
-        try:
-            item = store[idx]
-            caption = get_caption(item)
-            normalized = normalize_caption(
-                caption,
-                lowercase=not args.no_lowercase,
-                strip_image_token=not args.keep_image_token,
+    progress = build_progress(num_to_process, source.label, args.no_progress_bar)
+    start_time = time.perf_counter()
+    try:
+        for idx in range(num_to_process):
+            try:
+                item = store[idx]
+                caption = get_caption(item)
+                normalized = normalize_caption(
+                    caption,
+                    lowercase=not args.no_lowercase,
+                    strip_image_token=not args.keep_image_token,
+                )
+                accumulator.add_raw(len(normalized))
+                if tokenizer is not None:
+                    token_batch.append(normalized)
+                    if len(token_batch) >= args.batch_size:
+                        flush_token_batch(token_batch, tokenizer, accumulator, args.max_seq_length)
+            except Exception as exc:
+                accumulator.add_error(exc)
+
+            if progress is not None:
+                progress.update(1)
+            elif args.progress_every and (idx + 1) % args.progress_every == 0:
+                elapsed = time.perf_counter() - start_time
+                rate = (idx + 1) / elapsed if elapsed > 0 else 0.0
+                eprint(f"[{source.label}] analyzed {idx + 1}/{num_to_process} samples ({rate:.1f} samples/s)")
+
+        if tokenizer is not None:
+            flush_token_batch(token_batch, tokenizer, accumulator, args.max_seq_length)
+    finally:
+        if progress is not None:
+            elapsed = time.perf_counter() - start_time
+            rate = accumulator.sample_count / elapsed if elapsed > 0 else 0.0
+            progress.set_postfix(
+                samples=accumulator.sample_count,
+                skipped=accumulator.skipped_count,
+                rate=f"{rate:.1f}/s",
             )
-            accumulator.add_raw(len(normalized))
-            if tokenizer is not None:
-                token_batch.append(normalized)
-                if len(token_batch) >= args.batch_size:
-                    flush_token_batch(token_batch, tokenizer, accumulator, args.max_seq_length)
-        except Exception as exc:
-            accumulator.add_error(exc)
-
-        if args.progress_every and (idx + 1) % args.progress_every == 0:
-            eprint(f"[{source.label}] analyzed {idx + 1}/{num_to_process} samples")
-
-    if tokenizer is not None:
-        flush_token_batch(token_batch, tokenizer, accumulator, args.max_seq_length)
+            progress.close()
 
     payload = accumulator.finalize(
         max_seq_length=args.max_seq_length,
