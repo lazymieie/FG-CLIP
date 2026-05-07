@@ -10,6 +10,8 @@ from typing import Dict, Optional, Sequence, List
 from array import array
 from bisect import bisect_right
 import time
+import signal
+import threading
 
 import torch
 import random
@@ -74,6 +76,40 @@ def rank0_print(*args):
         print(*args)
 
 
+class SampleTimeoutError(TimeoutError):
+    pass
+
+
+def _timeout_handler(signum, frame):
+    raise SampleTimeoutError("Sample processing timed out.")
+
+
+def call_with_timeout(timeout_seconds: int, fn, *args, **kwargs):
+    if not timeout_seconds or timeout_seconds <= 0:
+        return fn(*args, **kwargs)
+    if threading.current_thread() is not threading.main_thread():
+        return fn(*args, **kwargs)
+
+    previous_handler = signal.getsignal(signal.SIGALRM)
+    signal.signal(signal.SIGALRM, _timeout_handler)
+    signal.setitimer(signal.ITIMER_REAL, timeout_seconds)
+    try:
+        return fn(*args, **kwargs)
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous_handler)
+
+
+def append_jsonl_record(log_path: Optional[str], record: dict) -> None:
+    if not log_path:
+        return
+    log_dir = os.path.dirname(log_path)
+    if log_dir:
+        os.makedirs(log_dir, exist_ok=True)
+    with open(log_path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
 @dataclass
 class ModelArguments:
     model_name_or_path: Optional[str] = field(default="qihoo360/fg-clip2-base")
@@ -125,6 +161,14 @@ class DataArguments:
     bad_sample_log_path: Optional[str] = field(
         default=None,
         metadata={"help": "Path to a jsonl log file for samples skipped due to per-sample exceptions."},
+    )
+    sample_timeout_seconds: int = field(
+        default=20,
+        metadata={"help": "Timeout in seconds for per-sample image loading/conversion. Set 0 to disable."},
+    )
+    preprocess_timeout_seconds: int = field(
+        default=20,
+        metadata={"help": "Timeout in seconds for image preprocessing in the collator. Set 0 to disable."},
     )
     max_image_pixels: int = field(
         default=50000000,
@@ -815,6 +859,7 @@ class LazySupervisedBboxDataset(Dataset):
         self.missing_image_log_path = data_args.missing_image_log_path
         self.large_image_log_path = data_args.large_image_log_path
         self.bad_sample_log_path = data_args.bad_sample_log_path
+        self.sample_timeout_seconds = data_args.sample_timeout_seconds
         self.max_image_pixels = data_args.max_image_pixels
         self.logged_missing_images = set()
         self.logged_large_images = set()
@@ -899,8 +944,7 @@ class LazySupervisedBboxDataset(Dataset):
             "resolved_path": image_name,
             "error": error,
         }
-        with open(self.missing_image_log_path, "a", encoding="utf-8") as f:
-            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+        append_jsonl_record(self.missing_image_log_path, record)
 
     def log_large_image(self, index, image_path, image_name, width, height):
         if self.large_image_log_path is None:
@@ -923,8 +967,7 @@ class LazySupervisedBboxDataset(Dataset):
             "pixels": width * height,
             "max_image_pixels": self.max_image_pixels,
         }
-        with open(self.large_image_log_path, "a", encoding="utf-8") as f:
-            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+        append_jsonl_record(self.large_image_log_path, record)
 
     def log_bad_sample(self, index, item, image_path, image_name, error):
         if self.bad_sample_log_path is None:
@@ -954,8 +997,7 @@ class LazySupervisedBboxDataset(Dataset):
             "item_keys": sorted(item.keys()) if isinstance(item, dict) else None,
             "caption_preview": caption_preview,
         }
-        with open(self.bad_sample_log_path, "a", encoding="utf-8") as f:
-            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+        append_jsonl_record(self.bad_sample_log_path, record)
 
     def load_valid_item(self, i):
         dataset_len = len(self.data_store)
@@ -981,13 +1023,13 @@ class LazySupervisedBboxDataset(Dataset):
                         caption_short = item["short_caption"]
 
                 image_name = self.resolve_image_name(image_path, is_cn)
-                image = Image.open(image_name)
+                image = call_with_timeout(self.sample_timeout_seconds, Image.open, image_name)
                 width, height = image.size
                 if self.max_image_pixels > 0 and width * height > self.max_image_pixels:
                     self.log_large_image(cur_idx, image_path, image_name, width, height)
                     image.close()
                     continue
-                image = image.convert("RGB")
+                image = call_with_timeout(self.sample_timeout_seconds, image.convert, "RGB")
             except (FileNotFoundError, OSError) as e:
                 self.log_missing_image(
                     cur_idx,
@@ -1149,6 +1191,9 @@ class LazySupervisedBboxDataset(Dataset):
 
         data_dict = {}
         data_dict['image'] = image_tensor
+        data_dict['sample_index'] = cur_idx
+        data_dict['image_path'] = image_path
+        data_dict['resolved_path'] = image_name
         data_dict['pixel_attention_mask'] = pixel_attention_mask
         data_dict['spatial_shapes'] = spatial_shapes
         
@@ -1182,6 +1227,8 @@ class DataCollatorForSupervisedDataset(object):
 
     preprocess: transformers.Siglip2ImageProcessor
     is_naflex: bool
+    bad_sample_log_path: Optional[str] = None
+    preprocess_timeout_seconds: int = 20
 
     def determine_max_value(self,values):
 
@@ -1212,10 +1259,24 @@ class DataCollatorForSupervisedDataset(object):
             for instance in instances:
 
                 try:
-                    image_input = self.preprocess(images=instance['image'].convert("RGB"), max_num_patches=batch_max_img_token, return_tensors='pt')
+                    rgb_image = call_with_timeout(self.preprocess_timeout_seconds, instance['image'].convert, "RGB")
+                    image_input = call_with_timeout(
+                        self.preprocess_timeout_seconds,
+                        self.preprocess,
+                        images=rgb_image,
+                        max_num_patches=batch_max_img_token,
+                        return_tensors='pt',
+                    )
                 except Exception as e:
-                    print(e)
-                    print("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!! get fail image !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
+                    append_jsonl_record(
+                        self.bad_sample_log_path,
+                        {
+                            "index": instance.get("sample_index"),
+                            "image_path": instance.get("image_path"),
+                            "resolved_path": instance.get("resolved_path"),
+                            "error": f"collator_preprocess_failed: {repr(e)}",
+                        },
+                    )
                     width, height = 384, 384  # 
                     channels = 3  
                     black_image_array = np.zeros((height, width, channels), dtype=np.uint8)
@@ -1291,7 +1352,12 @@ def make_supervised_data_module(data_args,img_preprocess,tokenizer,is_naflex) ->
                                 data_args=data_args,
                                 img_preprocess=img_preprocess,tokenizer=tokenizer,)
             
-    data_collator = DataCollatorForSupervisedDataset(preprocess=img_preprocess,is_naflex=is_naflex)
+    data_collator = DataCollatorForSupervisedDataset(
+        preprocess=img_preprocess,
+        is_naflex=is_naflex,
+        bad_sample_log_path=data_args.bad_sample_log_path,
+        preprocess_timeout_seconds=data_args.preprocess_timeout_seconds,
+    )
     return dict(train_dataset=train_dataset,
                 eval_dataset=None,
                 data_collator=data_collator)
