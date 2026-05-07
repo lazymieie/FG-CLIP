@@ -510,8 +510,7 @@ class FG_CLIP2_Model(Fgclip2Model):
                 loss_bbox_rcc = self.hard_category_contrastive_loss(bbox_text_embeds)
                 loss = loss + box_loss_weight*loss_bbox_itcl + region_cc_loss_weight*loss_bbox_rcc
 
-
-
+            threshold = self.thresholds
             if use_hard_neg:
                 hard_box_loss_weight = 0.5
 
@@ -524,19 +523,31 @@ class FG_CLIP2_Model(Fgclip2Model):
                 box_weight = box_weight.reshape(1, hard_bbox_image_embeds.shape[0]).squeeze()
                 select_index = box_weight.nonzero()
                 hard_bbox_image_embeds = hard_bbox_image_embeds[select_index,:].squeeze()
-                loss_bbox_hitc, threshold= self.hard_contrastive_total_loss(hard_bbox_image_embeds, hard_bbox_text_embeds, hard_bbox_text_embeds.device, self.thresholds, self.logit_scale_hardneg)
-                loss = loss + hard_box_loss_weight*loss_bbox_hitc
-            else:
-                threshold = self.thresholds
+                loss_bbox_hitc, threshold = self.hard_contrastive_total_loss(
+                    hard_bbox_image_embeds,
+                    hard_bbox_text_embeds,
+                    hard_bbox_text_embeds.device,
+                    self.thresholds,
+                    self.logit_scale_hardneg,
+                )
+                loss = loss + hard_box_loss_weight * loss_bbox_hitc
 
-            sum_threshold = self.all_reduce_threshold(threshold)
-            mean_threshold = sum_threshold/self.world_size
+            # Only synchronize thresholds when the current step actually computes
+            # fine-grained or hard-negative losses. Otherwise this collective is
+            # unnecessary and increases the chance of distributed stalls.
+            if add_box_loss or use_hard_neg:
+                sum_threshold = self.all_reduce_threshold(threshold)
+                mean_threshold = sum_threshold/self.world_size
 
-            upper_bound = 10
-            self.thresholds=torch.clamp(mean_threshold,0,upper_bound).item()
+                upper_bound = 10
+                self.thresholds = torch.clamp(mean_threshold, 0, upper_bound).item()
 
-        except:
-            pass
+        except Exception as exc:
+            rank = dist.get_rank() if dist.is_initialized() else -1
+            raise RuntimeError(
+                f"Fine-grained loss update failed on rank {rank} "
+                f"(add_box_loss={add_box_loss}, use_hard_neg={use_hard_neg})."
+            ) from exc
 
         return Fgclip2Output(
             loss=loss,
@@ -697,6 +708,5 @@ class FG_CLIP2_Model(Fgclip2Model):
             )
 
         return loss
-
 
 
