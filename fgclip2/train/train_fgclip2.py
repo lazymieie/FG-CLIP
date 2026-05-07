@@ -14,6 +14,7 @@ import signal
 import threading
 
 import torch
+import torch.multiprocessing as torch_mp
 import random
 
 
@@ -70,6 +71,11 @@ import gc
 local_rank = None
 IMAGE_TOKEN_PATTERN = re.compile(r"<image>")
 
+try:
+    torch_mp.set_sharing_strategy("file_system")
+except (RuntimeError, ValueError):
+    pass
+
 
 def rank0_print(*args):
     if local_rank == 0:
@@ -108,6 +114,13 @@ def append_jsonl_record(log_path: Optional[str], record: dict) -> None:
         os.makedirs(log_dir, exist_ok=True)
     with open(log_path, "a", encoding="utf-8") as f:
         f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
+def load_image_rgb(image_path: str):
+    with Image.open(image_path) as image:
+        width, height = image.size
+        rgb_image = image.convert("RGB")
+    return rgb_image, width, height
 
 
 @dataclass
@@ -1023,13 +1036,15 @@ class LazySupervisedBboxDataset(Dataset):
                         caption_short = item["short_caption"]
 
                 image_name = self.resolve_image_name(image_path, is_cn)
-                image = call_with_timeout(self.sample_timeout_seconds, Image.open, image_name)
-                width, height = image.size
+                image, width, height = call_with_timeout(
+                    self.sample_timeout_seconds,
+                    load_image_rgb,
+                    image_name,
+                )
                 if self.max_image_pixels > 0 and width * height > self.max_image_pixels:
                     self.log_large_image(cur_idx, image_path, image_name, width, height)
                     image.close()
                     continue
-                image = call_with_timeout(self.sample_timeout_seconds, image.convert, "RGB")
             except (FileNotFoundError, OSError) as e:
                 self.log_missing_image(
                     cur_idx,
