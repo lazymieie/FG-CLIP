@@ -1048,7 +1048,7 @@ class LazySupervisedBboxDataset(Dataset):
                 )
                 continue
 
-            return cur_idx, item, caption, caption_short, is_cn, image, image_name
+            return cur_idx, item, caption, caption_short, is_cn, image, image_path, image_name
 
         raise RuntimeError("No readable image was found in the dataset.")
 
@@ -1067,7 +1067,7 @@ class LazySupervisedBboxDataset(Dataset):
     
     def __getitem__(self, i) -> Dict[str, torch.Tensor]:
 
-        cur_idx, item, caption, caption_short, is_cn, image, image_name = self.load_valid_item(i)
+        cur_idx, item, caption, caption_short, is_cn, image, image_path, image_name = self.load_valid_item(i)
         
 
         prewidth, preheight = image.size
@@ -1314,6 +1314,9 @@ class DataCollatorForSupervisedDataset(object):
         
         batch["add_box_loss"] = instances[0]["add_box_loss"]
         batch["use_hard_neg"] = instances[0]["use_hard_neg"]
+        batch["sample_indices"] = [instance["sample_index"] for instance in instances]
+        batch["image_paths"] = [instance["image_path"] for instance in instances]
+        batch["resolved_paths"] = [instance["resolved_path"] for instance in instances]
         
         if batch["add_box_loss"]:
 

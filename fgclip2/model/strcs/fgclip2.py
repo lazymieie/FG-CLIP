@@ -1,3 +1,4 @@
+import os
 import torch
 import torch.nn as nn
 import math
@@ -86,6 +87,13 @@ class FG_CLIP2_Model(Fgclip2Model):
         self.pad_token_id = 0
         self.world_size = 0
         self.loss_type = None
+        self.debug_collectives = os.getenv("FGCLIP_DEBUG_COLLECTIVES", "0") == "1"
+        self.debug_collective_verbose = os.getenv("FGCLIP_DEBUG_VERBOSE_COLLECTIVES", "0") == "1"
+        self.debug_collective_sample_limit = int(os.getenv("FGCLIP_DEBUG_SAMPLE_LIMIT", "4"))
+        debug_ranks = os.getenv("FGCLIP_DEBUG_RANKS", "").strip()
+        self.debug_collective_ranks = {
+            int(part) for part in debug_ranks.split(",") if part.strip()
+        } if debug_ranks else set()
 
         
         # Initialize weights and apply final processing
@@ -278,6 +286,54 @@ class FG_CLIP2_Model(Fgclip2Model):
 
         return feature_map
 
+    def _collective_debug_enabled(self, rank: int) -> bool:
+        if not self.debug_collectives:
+            return False
+        if not self.debug_collective_ranks:
+            return True
+        return rank in self.debug_collective_ranks
+
+    def _summarize_debug_context(self, debug_context: Optional[dict]) -> dict:
+        if not debug_context:
+            return {}
+
+        sample_limit = max(self.debug_collective_sample_limit, 1)
+        sample_indices = debug_context.get("sample_indices") or []
+        image_paths = debug_context.get("image_paths") or []
+        resolved_paths = debug_context.get("resolved_paths") or []
+        samples = []
+
+        for idx, image_path, resolved_path in zip(
+            sample_indices[:sample_limit],
+            image_paths[:sample_limit],
+            resolved_paths[:sample_limit],
+        ):
+            samples.append(
+                {
+                    "sample_index": idx,
+                    "image_path": image_path,
+                    "resolved_path": resolved_path,
+                }
+            )
+
+        summary = {
+            "text_name": debug_context.get("text_name"),
+            "batch_size": debug_context.get("batch_size"),
+            "sample_count": len(sample_indices),
+            "samples": samples,
+        }
+        if len(sample_indices) > sample_limit:
+            summary["sample_count_total"] = len(sample_indices)
+        return summary
+
+    def _log_collective_event(self, rank: int, message: str, debug_context: Optional[dict] = None) -> None:
+        if not self._collective_debug_enabled(rank):
+            return
+        print(
+            f"[rank={rank}] {message} debug_context={self._summarize_debug_context(debug_context)}",
+            flush=True,
+        )
+
     def forward(
         self,
         text_short: Optional[torch.LongTensor] = None,
@@ -302,6 +358,9 @@ class FG_CLIP2_Model(Fgclip2Model):
         return_dict: Optional[bool] = None,
         add_box_loss: bool = False,
         use_hard_neg: bool = False,
+        sample_indices: Optional[list[int]] = None,
+        image_paths: Optional[list[str]] = None,
+        resolved_paths: Optional[list[str]] = None,
     ) -> Union[Tuple, Fgclip2Output]:
 
         # Use CLIP model's config for some fields (if specified) instead of those of vision & text components.
@@ -313,6 +372,13 @@ class FG_CLIP2_Model(Fgclip2Model):
 
 
         rank = dist.get_rank()
+        debug_context_base = {
+            "batch_size": pixel_values.shape[0] if pixel_values is not None else None,
+            "sample_indices": sample_indices,
+            "image_paths": image_paths,
+            "resolved_paths": resolved_paths,
+        }
+        self._log_collective_event(rank, "forward_start", debug_context_base)
          
         vision_outputs = self.vision_model(
             pixel_values=pixel_values,
@@ -474,10 +540,24 @@ class FG_CLIP2_Model(Fgclip2Model):
                 loss = loss_short if loss is None else loss + loss_short
         elif self.loss_type == "reduce":
             if text_long is not None:
-                loss_long = self.all_reduce_siglip_loss(image_embeds,long_text_embeds,logit_scale,logit_bias,rank)
+                loss_long = self.all_reduce_siglip_loss(
+                    image_embeds,
+                    long_text_embeds,
+                    logit_scale,
+                    logit_bias,
+                    rank,
+                    debug_context={**debug_context_base, "text_name": "long"},
+                )
                 loss = loss_long if loss is None else loss + loss_long
             if text_short is not None:
-                loss_short = self.all_reduce_siglip_loss(image_embeds,short_text_embeds,logit_scale,logit_bias,rank)
+                loss_short = self.all_reduce_siglip_loss(
+                    image_embeds,
+                    short_text_embeds,
+                    logit_scale,
+                    logit_bias,
+                    rank,
+                    debug_context={**debug_context_base, "text_name": "short"},
+                )
                 loss = loss_short if loss is None else loss + loss_short
         else:
             assert self.loss_type is not None
@@ -687,17 +767,55 @@ class FG_CLIP2_Model(Fgclip2Model):
         return loss
 
 
-    def all_reduce_siglip_loss(self, image_features, text_features, logit_scale, logit_bias, cur_rank, no_longtext_indices=None, output_dict=False):
+    def all_reduce_siglip_loss(
+        self,
+        image_features,
+        text_features,
+        logit_scale,
+        logit_bias,
+        cur_rank,
+        no_longtext_indices=None,
+        output_dict=False,
+        debug_context: Optional[dict] = None,
+    ):
         
         loss = self._loss(image_features, text_features, logit_scale, logit_bias)
+        self._log_collective_event(
+            cur_rank,
+            (
+                f"all_reduce_siglip_loss_start text_shape={tuple(text_features.shape)} "
+                f"dtype={text_features.dtype} device={text_features.device}"
+            ),
+            debug_context,
+        )
 
 
         for i in range(self.world_size):
+            if self.debug_collective_verbose:
+                self._log_collective_event(
+                    cur_rank,
+                    f"before_all_reduce peer_slot={i} text_shape={tuple(text_features.shape)}",
+                    debug_context,
+                )
 
-            text_from_other = torch.distributed.nn.all_reduce(
-                text_features * (cur_rank == i),
-                torch.distributed.ReduceOp.SUM,
-            )
+            try:
+                text_from_other = torch.distributed.nn.all_reduce(
+                    text_features * (cur_rank == i),
+                    torch.distributed.ReduceOp.SUM,
+                )
+            except Exception as exc:
+                raise RuntimeError(
+                    f"all_reduce_siglip_loss failed on rank {cur_rank} at peer_slot={i} "
+                    f"text_shape={tuple(text_features.shape)} "
+                    f"debug_context={self._summarize_debug_context(debug_context)}"
+                ) from exc
+
+            if self.debug_collective_verbose:
+                self._log_collective_event(
+                    cur_rank,
+                    f"after_all_reduce peer_slot={i}",
+                    debug_context,
+                )
 
             loss += float(i != cur_rank) * self._loss(
                 image_features,
@@ -708,5 +826,3 @@ class FG_CLIP2_Model(Fgclip2Model):
             )
 
         return loss
-
-
