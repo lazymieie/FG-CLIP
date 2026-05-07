@@ -122,6 +122,10 @@ class DataArguments:
         default=None,
         metadata={"help": "Path to a jsonl log file for skipped over-large training images."},
     )
+    bad_sample_log_path: Optional[str] = field(
+        default=None,
+        metadata={"help": "Path to a jsonl log file for samples skipped due to per-sample exceptions."},
+    )
     max_image_pixels: int = field(
         default=50000000,
         metadata={"help": "Skip images whose width * height exceeds this value. Set 0 to disable."},
@@ -810,9 +814,11 @@ class LazySupervisedBboxDataset(Dataset):
         self.cn_image_root = data_args.cn_image_root
         self.missing_image_log_path = data_args.missing_image_log_path
         self.large_image_log_path = data_args.large_image_log_path
+        self.bad_sample_log_path = data_args.bad_sample_log_path
         self.max_image_pixels = data_args.max_image_pixels
         self.logged_missing_images = set()
         self.logged_large_images = set()
+        self.logged_bad_samples = set()
 
     def __len__(self):
         return len(self.data_store)
@@ -920,31 +926,61 @@ class LazySupervisedBboxDataset(Dataset):
         with open(self.large_image_log_path, "a", encoding="utf-8") as f:
             f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
+    def log_bad_sample(self, index, item, image_path, image_name, error):
+        if self.bad_sample_log_path is None:
+            return
+
+        sample_key = (index, image_name, error)
+        if sample_key in self.logged_bad_samples:
+            return
+
+        self.logged_bad_samples.add(sample_key)
+        log_dir = os.path.dirname(self.bad_sample_log_path)
+        if log_dir:
+            os.makedirs(log_dir, exist_ok=True)
+
+        caption_preview = None
+        try:
+            caption_preview = IMAGE_TOKEN_PATTERN.sub("", self.get_caption(item)).strip()[:256]
+        except Exception:
+            pass
+
+        record = {
+            "index": index,
+            "image_path": image_path,
+            "resolved_path": image_name,
+            "error": error,
+            "item_id": item.get("id") if isinstance(item, dict) else None,
+            "item_keys": sorted(item.keys()) if isinstance(item, dict) else None,
+            "caption_preview": caption_preview,
+        }
+        with open(self.bad_sample_log_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
     def load_valid_item(self, i):
         dataset_len = len(self.data_store)
         for offset in range(dataset_len):
             cur_idx = (i + offset) % dataset_len
-            item = self.data_store[cur_idx]
-            caption = IMAGE_TOKEN_PATTERN.sub("", self.get_caption(item)).strip()
-            image_path = self.get_image_path(item)
-            caption_short = None
-
-            if "is_cn" not in item.keys():
-                is_cn = False
-                if self.use_short_caption:
-                    if "short_caption" not in item:
-                        raise KeyError("short_caption is required when use_short_caption=True")
-                    caption_short = "a photo of "+item["short_caption"]
-            else:
-                is_cn = True
-                if self.use_short_caption:
-                    if "short_caption" not in item:
-                        raise KeyError("short_caption is required when use_short_caption=True")
-                    caption_short = item["short_caption"]
-
-            image_name = self.resolve_image_name(image_path, is_cn)
-
             try:
+                item = self.data_store[cur_idx]
+                caption = IMAGE_TOKEN_PATTERN.sub("", self.get_caption(item)).strip()
+                image_path = self.get_image_path(item)
+                caption_short = None
+
+                if "is_cn" not in item.keys():
+                    is_cn = False
+                    if self.use_short_caption:
+                        if "short_caption" not in item:
+                            raise KeyError("short_caption is required when use_short_caption=True")
+                        caption_short = "a photo of "+item["short_caption"]
+                else:
+                    is_cn = True
+                    if self.use_short_caption:
+                        if "short_caption" not in item:
+                            raise KeyError("short_caption is required when use_short_caption=True")
+                        caption_short = item["short_caption"]
+
+                image_name = self.resolve_image_name(image_path, is_cn)
                 image = Image.open(image_name)
                 width, height = image.size
                 if self.max_image_pixels > 0 and width * height > self.max_image_pixels:
@@ -953,7 +989,21 @@ class LazySupervisedBboxDataset(Dataset):
                     continue
                 image = image.convert("RGB")
             except (FileNotFoundError, OSError) as e:
-                self.log_missing_image(cur_idx, image_path, image_name, repr(e))
+                self.log_missing_image(
+                    cur_idx,
+                    image_path if "image_path" in locals() else None,
+                    image_name if "image_name" in locals() else None,
+                    repr(e),
+                )
+                continue
+            except Exception as e:
+                self.log_bad_sample(
+                    cur_idx,
+                    item if "item" in locals() else None,
+                    image_path if "image_path" in locals() else None,
+                    image_name if "image_name" in locals() else None,
+                    repr(e),
+                )
                 continue
 
             return item, caption, caption_short, is_cn, image, image_name
