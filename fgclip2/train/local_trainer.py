@@ -28,6 +28,7 @@ import os
 import random
 import re
 import shutil
+import signal
 import sys
 import tempfile
 import time
@@ -384,6 +385,99 @@ class BilingualSampler(Sampler):
 
 
 class CLIPTrainer(Trainer):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.debug_dump_on_exception = os.getenv("FGCLIP_DEBUG_DUMP_ON_EXCEPTION", "1") == "1"
+        self.debug_failfast_on_exception = os.getenv("FGCLIP_DEBUG_FAILFAST_ON_EXCEPTION", "1") == "1"
+        self.debug_pause_on_exception = os.getenv("FGCLIP_DEBUG_PAUSE_ON_EXCEPTION", "0") == "1"
+        self.debug_dump_dir = os.getenv(
+            "FGCLIP_DEBUG_DUMP_DIR",
+            os.path.join(self.args.output_dir, "debug_exception_dumps"),
+        )
+        self.debug_dump_sample_limit = int(os.getenv("FGCLIP_DEBUG_SAMPLE_LIMIT", "8"))
+
+    def _get_rank(self) -> int:
+        if dist.is_available() and dist.is_initialized():
+            return dist.get_rank()
+        return -1
+
+    def _summarize_value(self, value):
+        if isinstance(value, torch.Tensor):
+            return {
+                "type": "tensor",
+                "shape": list(value.shape),
+                "dtype": str(value.dtype),
+                "device": str(value.device),
+            }
+        if isinstance(value, (str, int, float, bool)) or value is None:
+            return value
+        if isinstance(value, list):
+            limited = value[: self.debug_dump_sample_limit]
+            return [self._summarize_value(item) for item in limited]
+        if isinstance(value, tuple):
+            limited = value[: self.debug_dump_sample_limit]
+            return [self._summarize_value(item) for item in limited]
+        if isinstance(value, dict):
+            return {k: self._summarize_value(v) for k, v in value.items()}
+        return repr(value)
+
+    def _dump_debug_batch(self, inputs, exc: Exception) -> Optional[str]:
+        if not self.debug_dump_on_exception:
+            return None
+
+        os.makedirs(self.debug_dump_dir, exist_ok=True)
+        rank = self._get_rank()
+        dump_path = os.path.join(
+            self.debug_dump_dir,
+            f"rank{rank}_step{self.state.global_step}_pid{os.getpid()}.json",
+        )
+        payload = {
+            "rank": rank,
+            "pid": os.getpid(),
+            "global_step": self.state.global_step,
+            "epoch": self.state.epoch,
+            "exception_type": type(exc).__name__,
+            "exception_repr": repr(exc),
+            "sample_indices": inputs.get("sample_indices"),
+            "image_paths": inputs.get("image_paths"),
+            "resolved_paths": inputs.get("resolved_paths"),
+            "keys": sorted(inputs.keys()),
+            "inputs": {
+                key: self._summarize_value(value)
+                for key, value in inputs.items()
+            },
+        }
+        with open(dump_path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+        return dump_path
+
+    def _handle_training_exception(self, inputs, exc: Exception) -> None:
+        dump_path = self._dump_debug_batch(inputs, exc)
+        rank = self._get_rank()
+        print(
+            f"[rank={rank}] training_step exception at global_step={self.state.global_step} "
+            f"pid={os.getpid()} dump_path={dump_path} error={repr(exc)}",
+            flush=True,
+        )
+
+        if self.debug_pause_on_exception:
+            print(
+                f"[rank={rank}] FGCLIP_DEBUG_PAUSE_ON_EXCEPTION=1, process paused for attach. pid={os.getpid()}",
+                flush=True,
+            )
+            os.kill(os.getpid(), signal.SIGSTOP)
+
+        if self.debug_failfast_on_exception:
+            raise RuntimeError(
+                f"Fail-fast after training_step exception on rank {rank}. dump_path={dump_path}"
+            ) from exc
+
+    def training_step(self, model: nn.Module, inputs: Dict[str, Union[torch.Tensor, Any]], *args, **kwargs) -> torch.Tensor:
+        try:
+            return super().training_step(model, inputs, *args, **kwargs)
+        except Exception as exc:
+            self._handle_training_exception(inputs, exc)
+            raise
 
     def _get_train_sampler(self, train_dataset: Optional[Dataset] = None) -> Optional[torch.utils.data.Sampler]:
         if train_dataset is None:
