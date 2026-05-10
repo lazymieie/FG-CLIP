@@ -187,6 +187,10 @@ class DataArguments:
         default=20,
         metadata={"help": "Timeout in seconds for image preprocessing in the collator. Set 0 to disable."},
     )
+    max_caption_tokens: int = field(
+        default=0,
+        metadata={"help": "Skip training samples whose main caption token length exceeds this value. Set 0 to disable."},
+    )
     max_image_pixels: int = field(
         default=50000000,
         metadata={"help": "Skip images whose width * height exceeds this value. Set 0 to disable."},
@@ -863,6 +867,7 @@ class LazySupervisedBboxDataset(Dataset):
         self.box_image_size = data_args.box_image_size
         self.add_box_loss = data_args.add_box_loss
         self.use_hard_neg = data_args.use_hard_neg
+        self.max_caption_tokens = data_args.max_caption_tokens
         self.cn_image_root = data_args.cn_image_root
         self.missing_image_log_path = data_args.missing_image_log_path
         self.large_image_log_path = data_args.large_image_log_path
@@ -872,9 +877,10 @@ class LazySupervisedBboxDataset(Dataset):
         self.logged_missing_images = set()
         self.logged_large_images = set()
         self.logged_bad_samples = set()
+        self.valid_indices = self.build_valid_indices()
 
     def __len__(self):
-        return len(self.data_store)
+        return len(self.valid_indices)
 
     def get_caption(self, item):
         if "caption" in item:
@@ -910,6 +916,45 @@ class LazySupervisedBboxDataset(Dataset):
             if part:
                 image_roots.append(part)
         return image_roots
+
+    def caption_exceeds_max_tokens(self, caption: str) -> bool:
+        if self.max_caption_tokens <= 0 or self.tokenizer is None:
+            return False
+
+        input_ids = self.tokenizer(
+            [caption.lower()],
+            add_special_tokens=True,
+            padding=False,
+            truncation=False,
+            return_attention_mask=False,
+            return_token_type_ids=False,
+        ).input_ids
+        return len(input_ids[0]) > self.max_caption_tokens
+
+    def build_valid_indices(self):
+        if self.max_caption_tokens <= 0 or self.tokenizer is None:
+            return list(range(len(self.data_store)))
+
+        rank0_print(
+            f"Filtering samples by caption token length <= {self.max_caption_tokens} before training..."
+        )
+        valid_indices = []
+        for cur_idx in range(len(self.data_store)):
+            try:
+                item = self.data_store[cur_idx]
+                caption = IMAGE_TOKEN_PATTERN.sub("", self.get_caption(item)).strip()
+                if self.caption_exceeds_max_tokens(caption):
+                    continue
+                valid_indices.append(cur_idx)
+            except Exception:
+                # Keep the sample in the candidate set; existing runtime guards will handle
+                # unreadable/malformed records without collapsing the dataset at init time.
+                valid_indices.append(cur_idx)
+
+        rank0_print(
+            f"Caption length filtering kept {len(valid_indices)}/{len(self.data_store)} samples."
+        )
+        return valid_indices
 
     def resolve_image_name(self, image_path, is_cn):
         if os.path.isabs(image_path):
@@ -1008,9 +1053,10 @@ class LazySupervisedBboxDataset(Dataset):
         append_jsonl_record(self.bad_sample_log_path, record)
 
     def load_valid_item(self, i):
-        dataset_len = len(self.data_store)
+        dataset_len = len(self.valid_indices)
         for offset in range(dataset_len):
-            cur_idx = (i + offset) % dataset_len
+            dataset_idx = (i + offset) % dataset_len
+            cur_idx = self.valid_indices[dataset_idx]
             try:
                 item = self.data_store[cur_idx]
                 caption = IMAGE_TOKEN_PATTERN.sub("", self.get_caption(item)).strip()
@@ -1066,7 +1112,7 @@ class LazySupervisedBboxDataset(Dataset):
     @property
     def modality_lengths(self):
         length_list = []
-        for cur_idx in range(self.all_data_length):
+        for cur_idx in self.valid_indices:
             if cur_idx < self.en_data_length:
                 length_list.append(1)
             else:
