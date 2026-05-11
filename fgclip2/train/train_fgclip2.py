@@ -859,6 +859,7 @@ class LazySupervisedBboxDataset(Dataset):
 
         self.data_args = data_args
         self.preprocess = img_preprocess
+        self.data_path = data_path
         self.image_root = data_args.image_folder
         self.extra_image_roots = self.parse_image_roots(data_args.extra_image_folders)
         self.max_length = data_args.max_seq_length
@@ -935,26 +936,124 @@ class LazySupervisedBboxDataset(Dataset):
         if self.max_caption_tokens <= 0 or self.tokenizer is None:
             return list(range(len(self.data_store)))
 
+        tokenizer_name_or_path = getattr(self.tokenizer, "name_or_path", None)
+        cache_path = make_valid_indices_cache_path(
+            self.data_path,
+            self.data_args.index_cache_root,
+            self.max_caption_tokens,
+            tokenizer_name_or_path,
+            self.data_args.cn_pair_root,
+        )
+        cached_indices = array("Q")
+        if load_existing_valid_indices_if_valid(
+            cache_path,
+            self.data_path,
+            self.data_args.cn_pair_root,
+            tokenizer_name_or_path,
+            self.max_caption_tokens,
+            len(self.data_store),
+            cached_indices,
+        ):
+            rank0_print(
+                f"Loaded caption-filtered index cache: {cache_path} "
+                f"({len(cached_indices)}/{len(self.data_store)} samples kept)"
+            )
+            return list(cached_indices)
+
+        lock_file = None if cache_path is None else f"{cache_path}.lock"
+        lock_acquired = False
         rank0_print(
             f"Filtering samples by caption token length <= {self.max_caption_tokens} before training..."
         )
-        valid_indices = []
-        for cur_idx in range(len(self.data_store)):
-            try:
-                item = self.data_store[cur_idx]
-                caption = IMAGE_TOKEN_PATTERN.sub("", self.get_caption(item)).strip()
-                if self.caption_exceeds_max_tokens(caption):
-                    continue
-                valid_indices.append(cur_idx)
-            except Exception:
-                # Keep the sample in the candidate set; existing runtime guards will handle
-                # unreadable/malformed records without collapsing the dataset at init time.
-                valid_indices.append(cur_idx)
+        try:
+            if lock_file is not None:
+                start_time = time.time()
+                while True:
+                    try:
+                        fd = os.open(lock_file, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                        with os.fdopen(fd, "w", encoding="utf-8") as f:
+                            f.write(f"{os.getpid()}\n")
+                        lock_acquired = True
+                        break
+                    except FileExistsError:
+                        if time.time() - start_time > AUTO_INDEX_LOCK_TIMEOUT_SECONDS:
+                            raise TimeoutError(f"Timed out waiting for valid index cache lock: {lock_file}")
 
-        rank0_print(
-            f"Caption length filtering kept {len(valid_indices)}/{len(self.data_store)} samples."
-        )
-        return valid_indices
+                        if load_existing_valid_indices_if_valid(
+                            cache_path,
+                            self.data_path,
+                            self.data_args.cn_pair_root,
+                            tokenizer_name_or_path,
+                            self.max_caption_tokens,
+                            len(self.data_store),
+                            cached_indices,
+                        ):
+                            rank0_print(
+                                f"Loaded caption-filtered index cache: {cache_path} "
+                                f"({len(cached_indices)}/{len(self.data_store)} samples kept)"
+                            )
+                            return list(cached_indices)
+
+                        time.sleep(AUTO_INDEX_LOCK_POLL_SECONDS)
+
+                if load_existing_valid_indices_if_valid(
+                    cache_path,
+                    self.data_path,
+                    self.data_args.cn_pair_root,
+                    tokenizer_name_or_path,
+                    self.max_caption_tokens,
+                    len(self.data_store),
+                    cached_indices,
+                ):
+                    rank0_print(
+                        f"Loaded caption-filtered index cache: {cache_path} "
+                        f"({len(cached_indices)}/{len(self.data_store)} samples kept)"
+                    )
+                    return list(cached_indices)
+
+            valid_indices = []
+            for cur_idx in range(len(self.data_store)):
+                try:
+                    item = self.data_store[cur_idx]
+                    caption = IMAGE_TOKEN_PATTERN.sub("", self.get_caption(item)).strip()
+                    if self.caption_exceeds_max_tokens(caption):
+                        continue
+                    valid_indices.append(cur_idx)
+                except Exception:
+                    # Keep the sample in the candidate set; existing runtime guards will handle
+                    # unreadable/malformed records without collapsing the dataset at init time.
+                    valid_indices.append(cur_idx)
+
+            if cache_path is not None:
+                cache_dir = os.path.dirname(cache_path)
+                if cache_dir:
+                    os.makedirs(cache_dir, exist_ok=True)
+                tmp_cache_path = f"{cache_path}.tmp.{os.getpid()}"
+                valid_index_array = array("Q", valid_indices)
+                with open(tmp_cache_path, "wb") as f:
+                    valid_index_array.tofile(f)
+                os.replace(tmp_cache_path, cache_path)
+                meta = build_valid_indices_meta(
+                    self.data_path,
+                    self.data_args.cn_pair_root,
+                    tokenizer_name_or_path,
+                    self.max_caption_tokens,
+                    len(self.data_store),
+                    len(valid_indices),
+                )
+                meta["index_file"] = cache_path
+                write_index_meta(cache_path, meta)
+
+            rank0_print(
+                f"Caption length filtering kept {len(valid_indices)}/{len(self.data_store)} samples."
+            )
+            return valid_indices
+        finally:
+            if lock_acquired and lock_file is not None:
+                try:
+                    os.remove(lock_file)
+                except FileNotFoundError:
+                    pass
 
     def resolve_image_name(self, image_path, is_cn):
         if os.path.isabs(image_path):
