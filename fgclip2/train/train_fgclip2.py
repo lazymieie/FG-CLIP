@@ -400,6 +400,140 @@ def load_existing_offsets_if_valid(
     return True
 
 
+def path_signature(path: Optional[str]) -> dict:
+    if not path:
+        return {"path": None, "exists": False, "size": None, "mtime": None}
+
+    abs_path = os.path.abspath(path)
+    exists = os.path.exists(abs_path)
+    return {
+        "path": abs_path,
+        "exists": exists,
+        "size": os.path.getsize(abs_path) if exists else None,
+        "mtime": os.path.getmtime(abs_path) if exists else None,
+    }
+
+
+def make_valid_indices_cache_path(
+    data_path: str,
+    index_cache_root: Optional[str],
+    max_caption_tokens: int,
+    tokenizer_name_or_path: Optional[str],
+    cn_pair_root: Optional[str] = None,
+) -> Optional[str]:
+    if not index_cache_root or max_caption_tokens <= 0:
+        return None
+
+    payload = {
+        "data_path": os.path.abspath(data_path),
+        "cn_pair_root": os.path.abspath(cn_pair_root) if cn_pair_root else None,
+        "max_caption_tokens": max_caption_tokens,
+        "tokenizer_name_or_path": tokenizer_name_or_path,
+    }
+    digest = hashlib.sha1(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()[:16]
+    basename = os.path.basename(os.path.abspath(data_path))
+    return os.path.join(
+        index_cache_root,
+        f"{basename}.{digest}.caption_le_{max_caption_tokens}.valid.idx",
+    )
+
+
+def build_valid_indices_meta(
+    data_path: str,
+    cn_pair_root: Optional[str],
+    tokenizer_name_or_path: Optional[str],
+    max_caption_tokens: int,
+    total_source_records: int,
+    total_valid_records: int,
+) -> dict:
+    return {
+        "index_kind": "caption_valid_indices",
+        "data_path": path_signature(data_path),
+        "cn_pair_root": path_signature(cn_pair_root),
+        "tokenizer_name_or_path": tokenizer_name_or_path,
+        "max_caption_tokens": max_caption_tokens,
+        "total_source_records": total_source_records,
+        "total_valid_records": total_valid_records,
+        "index_file": None,
+    }
+
+
+def valid_indices_cache_matches(
+    meta: Optional[dict],
+    data_path: str,
+    cn_pair_root: Optional[str],
+    tokenizer_name_or_path: Optional[str],
+    max_caption_tokens: int,
+    total_source_records: int,
+) -> bool:
+    if meta is None:
+        return False
+
+    if meta.get("index_kind") != "caption_valid_indices":
+        return False
+
+    if meta.get("tokenizer_name_or_path") != tokenizer_name_or_path:
+        return False
+
+    if meta.get("max_caption_tokens") != max_caption_tokens:
+        return False
+
+    if meta.get("total_source_records") != total_source_records:
+        return False
+
+    for key, expected_path in (("data_path", data_path), ("cn_pair_root", cn_pair_root)):
+        expected = path_signature(expected_path)
+        actual = meta.get(key, {})
+        for field_name in ("path", "exists", "size", "mtime"):
+            if actual.get(field_name) != expected.get(field_name):
+                return False
+
+    return True
+
+
+def load_existing_valid_indices_if_valid(
+    index_file: Optional[str],
+    data_path: str,
+    cn_pair_root: Optional[str],
+    tokenizer_name_or_path: Optional[str],
+    max_caption_tokens: int,
+    total_source_records: int,
+    valid_index_array: array,
+) -> bool:
+    if index_file is None or not os.path.exists(index_file):
+        return False
+
+    try:
+        meta = read_index_meta(index_file)
+        if not valid_indices_cache_matches(
+            meta,
+            data_path,
+            cn_pair_root,
+            tokenizer_name_or_path,
+            max_caption_tokens,
+            total_source_records,
+        ):
+            return False
+
+        del valid_index_array[:]
+        index_size = os.path.getsize(index_file)
+        with open(index_file, "rb") as f:
+            valid_index_array.fromfile(f, index_size // valid_index_array.itemsize)
+    except FileNotFoundError:
+        return False
+
+    if any(index >= total_source_records for index in valid_index_array):
+        raise ValueError(f"Valid index cache {index_file} is corrupted.")
+
+    expected_valid_records = meta.get("total_valid_records")
+    if expected_valid_records is not None and len(valid_index_array) != expected_valid_records:
+        raise ValueError(
+            f"Valid index cache {index_file} has {len(valid_index_array)} records, expected {expected_valid_records}."
+        )
+
+    return True
+
+
 class IndexBuildLock:
     def __init__(
         self,
