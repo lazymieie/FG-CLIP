@@ -16,6 +16,7 @@ PT_SAMPLE_PATH="${PT_SAMPLE_PATH:-$DATA_WORK_DIR/pt_llava-ov-mid-v1_sample${PT_S
 DATA_PATH="${DATA_PATH:-$DATA_WORK_DIR/stage1_longonly_2M_manifest.txt}"
 IMG_ROOT="${IMG_ROOT:-$ROOT/data}"
 LOG_DIR="$ROOT/output/stage1_siglip2_bs288_so_zero0_longonly_2M"
+USE_LONG_CAPTION="${USE_LONG_CAPTION:-True}"
 USE_SHORT_CAPTION="${USE_SHORT_CAPTION:-False}"
 MAX_IMAGE_PIXELS="${MAX_IMAGE_PIXELS:-50000000}"
 
@@ -35,6 +36,7 @@ echo "PT_SAMPLE_PATH=$PT_SAMPLE_PATH"
 echo "DATA_PATH=$DATA_PATH"
 echo "LOG_DIR=$LOG_DIR"
 echo "CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
+echo "USE_LONG_CAPTION=$USE_LONG_CAPTION"
 echo "USE_SHORT_CAPTION=$USE_SHORT_CAPTION"
 echo "MAX_IMAGE_PIXELS=$MAX_IMAGE_PIXELS"
 
@@ -87,6 +89,7 @@ deepspeed --num_gpus 8 fgclip2/train/train.py \
     --box_image_size 512 \
     --base_seq_length 64 \
     --max_seq_length 196 \
+    --use_long_caption "$USE_LONG_CAPTION" \
     --use_short_caption "$USE_SHORT_CAPTION" \
     --save_safetensors True \
     --bf16 True \

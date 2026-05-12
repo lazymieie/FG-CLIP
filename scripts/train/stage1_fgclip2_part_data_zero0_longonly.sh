@@ -6,6 +6,7 @@ MODEL_DIR="$ROOT/qihoo360_fg-clip2-so400m"
 DATA_PATH="$ROOT/data/FineHARD/debug_coyo0_00000_exact_small.json"
 IMG_ROOT="$ROOT/data"
 LOG_DIR="$ROOT/output/stage1_fgclip2_bs256_epo10_so_zero0_longonly"
+USE_LONG_CAPTION="${USE_LONG_CAPTION:-True}"
 USE_SHORT_CAPTION="${USE_SHORT_CAPTION:-False}"
 
 mkdir -p "$LOG_DIR"
@@ -37,6 +38,7 @@ deepspeed --num_gpus 8 fgclip2/train/train.py \
     --box_image_size 512 \
     --base_seq_length 64 \
     --max_seq_length 196 \
+    --use_long_caption "$USE_LONG_CAPTION" \
     --use_short_caption "$USE_SHORT_CAPTION" \
     --save_safetensors True \
     --bf16 True \

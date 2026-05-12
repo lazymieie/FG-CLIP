@@ -158,6 +158,10 @@ class DataArguments:
     image_grid_pinpoints: Optional[str] = field(default=None)
     max_seq_length: int = 64*4-60
     base_seq_length: int = 64
+    use_long_caption: bool = field(
+        default=True,
+        metadata={"help": "Whether to train with the long caption image-text loss."},
+    )
     use_short_caption: bool = field(
         default=True,
         metadata={"help": "Whether to train with the short caption image-text loss."},
@@ -189,13 +193,17 @@ class DataArguments:
     )
     max_caption_tokens: int = field(
         default=0,
-        metadata={"help": "Skip training samples whose main caption token length exceeds this value. Set 0 to disable."},
+        metadata={"help": "Skip training samples whose main long caption token length exceeds this value. Set 0 to disable."},
     )
     max_image_pixels: int = field(
         default=50000000,
         metadata={"help": "Skip images whose width * height exceeds this value. Set 0 to disable."},
     )
     max_num_patches: int = 0
+
+    def __post_init__(self):
+        if not self.use_long_caption and not self.use_short_caption:
+            raise ValueError("At least one of use_long_caption or use_short_caption must be True.")
 
 
     
@@ -1024,6 +1032,7 @@ class LazySupervisedBboxDataset(Dataset):
         self.extra_image_roots = self.parse_image_roots(data_args.extra_image_folders)
         self.max_length = data_args.max_seq_length
         self.base_length = data_args.base_seq_length
+        self.use_long_caption = data_args.use_long_caption
         self.use_short_caption = data_args.use_short_caption
         self.box_image_size = data_args.box_image_size
         self.add_box_loss = data_args.add_box_loss
@@ -1093,6 +1102,9 @@ class LazySupervisedBboxDataset(Dataset):
         return len(input_ids[0]) > self.max_caption_tokens
 
     def build_valid_indices(self):
+        if not self.use_long_caption:
+            return list(range(len(self.data_store)))
+
         if self.max_caption_tokens <= 0 or self.tokenizer is None:
             return list(range(len(self.data_store)))
 
@@ -1318,7 +1330,9 @@ class LazySupervisedBboxDataset(Dataset):
             cur_idx = self.valid_indices[dataset_idx]
             try:
                 item = self.data_store[cur_idx]
-                caption = IMAGE_TOKEN_PATTERN.sub("", self.get_caption(item)).strip()
+                caption = None
+                if self.use_long_caption:
+                    caption = IMAGE_TOKEN_PATTERN.sub("", self.get_caption(item)).strip()
                 image_path = self.get_image_path(item)
                 caption_short = None
 
@@ -1407,12 +1421,20 @@ class LazySupervisedBboxDataset(Dataset):
 
         
         max_img_token = torch.tensor([max_img_token])
-        
-        text =  torch.tensor(self.tokenizer([caption.lower()], max_length=self.max_length, padding="max_length", truncation=True).input_ids, dtype=torch.long)
+
+        text = None
+        if self.use_long_caption:
+            text = torch.tensor(
+                self.tokenizer([caption.lower()], max_length=self.max_length, padding="max_length", truncation=True).input_ids,
+                dtype=torch.long,
+            )
         short_text = None
         if self.use_short_caption:
-            short_text = torch.tensor(self.tokenizer([caption_short.lower()], max_length=self.base_length, padding="max_length", truncation=True).input_ids, dtype=torch.long)
-        tensor_device = text.device
+            short_text = torch.tensor(
+                self.tokenizer([caption_short.lower()], max_length=self.base_length, padding="max_length", truncation=True).input_ids,
+                dtype=torch.long,
+            )
+        tensor_device = text.device if text is not None else short_text.device
 
 
 
@@ -1614,7 +1636,7 @@ class DataCollatorForSupervisedDataset(object):
 
         texts = [instance['text'] for instance in instances]
 
-        if None in texts:
+        if any(text is None for text in texts):
             batch['text_long'] = None
             batch['text_long_flag'] = torch.tensor([0], device=batch['pixel_values'].device)
         else:
@@ -1688,6 +1710,8 @@ def train():
     parser = transformers.HfArgumentParser(
         (ModelArguments, DataArguments, TrainingArguments))
     model_args, data_args, training_args = parser.parse_args_into_dataclasses()
+    if not data_args.use_long_caption and not data_args.use_short_caption:
+        raise ValueError("At least one of --use_long_caption or --use_short_caption must be enabled.")
     local_rank = training_args.local_rank
     compute_dtype = (torch.float16 if training_args.fp16 else (torch.bfloat16 if training_args.bf16 else torch.float32))
     # compute_dtype = torch.float32
