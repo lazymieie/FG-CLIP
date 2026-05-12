@@ -162,9 +162,17 @@ class DataArguments:
         default=True,
         metadata={"help": "Whether to train with the long caption image-text loss."},
     )
+    long_caption_field: str = field(
+        default="caption",
+        metadata={"help": "JSON field to use as the long-caption source. Use 'messages' to read assistant content from messages."},
+    )
     use_short_caption: bool = field(
         default=True,
         metadata={"help": "Whether to train with the short caption image-text loss."},
+    )
+    short_caption_field: str = field(
+        default="short_caption",
+        metadata={"help": "JSON field to use as the short-caption source. Use 'messages' to read assistant content from messages."},
     )
     box_image_size: int = 224
     add_box_loss: bool = field(default=False)
@@ -1033,7 +1041,9 @@ class LazySupervisedBboxDataset(Dataset):
         self.max_length = data_args.max_seq_length
         self.base_length = data_args.base_seq_length
         self.use_long_caption = data_args.use_long_caption
+        self.long_caption_field = data_args.long_caption_field
         self.use_short_caption = data_args.use_short_caption
+        self.short_caption_field = data_args.short_caption_field
         self.box_image_size = data_args.box_image_size
         self.add_box_loss = data_args.add_box_loss
         self.use_hard_neg = data_args.use_hard_neg
@@ -1066,6 +1076,30 @@ class LazySupervisedBboxDataset(Dataset):
                     return message["content"]
 
         raise KeyError("caption is required, or messages must contain a content field")
+
+    def get_message_caption(self, item):
+        messages = item.get("messages")
+        if isinstance(messages, list):
+            for message in messages:
+                if isinstance(message, dict) and message.get("role") == "assistant" and message.get("content"):
+                    return message["content"]
+            for message in messages:
+                if isinstance(message, dict) and message.get("content"):
+                    return message["content"]
+
+        raise KeyError("messages must contain a content field")
+
+    def get_configured_caption(self, item, field_name: str, default_field_name: str):
+        if field_name == "messages":
+            return self.get_message_caption(item)
+
+        if field_name == "caption" and default_field_name == "caption":
+            return self.get_caption(item)
+
+        if field_name in item:
+            return item[field_name]
+
+        raise KeyError(f"{field_name} is required for configured caption field")
 
     def get_image_path(self, item):
         if "f_path" in item:
@@ -1187,7 +1221,10 @@ class LazySupervisedBboxDataset(Dataset):
             for cur_idx in range(len(self.data_store)):
                 try:
                     item = self.data_store[cur_idx]
-                    caption = IMAGE_TOKEN_PATTERN.sub("", self.get_caption(item)).strip()
+                    caption = IMAGE_TOKEN_PATTERN.sub(
+                        "",
+                        self.get_configured_caption(item, self.long_caption_field, "caption"),
+                    ).strip()
                     if self.caption_exceeds_max_tokens(caption):
                         continue
                     valid_indices.append(cur_idx)
@@ -1308,7 +1345,13 @@ class LazySupervisedBboxDataset(Dataset):
 
         caption_preview = None
         try:
-            caption_preview = IMAGE_TOKEN_PATTERN.sub("", self.get_caption(item)).strip()[:256]
+            preview_source = None
+            if self.use_long_caption:
+                preview_source = self.get_configured_caption(item, self.long_caption_field, "caption")
+            elif self.use_short_caption:
+                preview_source = self.get_configured_caption(item, self.short_caption_field, "short_caption")
+            if preview_source is not None:
+                caption_preview = IMAGE_TOKEN_PATTERN.sub("", preview_source).strip()[:256]
         except Exception:
             pass
 
@@ -1332,22 +1375,22 @@ class LazySupervisedBboxDataset(Dataset):
                 item = self.data_store[cur_idx]
                 caption = None
                 if self.use_long_caption:
-                    caption = IMAGE_TOKEN_PATTERN.sub("", self.get_caption(item)).strip()
+                    caption = IMAGE_TOKEN_PATTERN.sub(
+                        "",
+                        self.get_configured_caption(item, self.long_caption_field, "caption"),
+                    ).strip()
                 image_path = self.get_image_path(item)
                 caption_short = None
 
                 if "is_cn" not in item.keys():
                     is_cn = False
                     if self.use_short_caption:
-                        if "short_caption" not in item:
-                            raise KeyError("short_caption is required when use_short_caption=True")
-                        caption_short = "a photo of "+item["short_caption"]
+                        caption_short = self.get_configured_caption(item, self.short_caption_field, "short_caption")
+                        caption_short = "a photo of " + caption_short
                 else:
                     is_cn = True
                     if self.use_short_caption:
-                        if "short_caption" not in item:
-                            raise KeyError("short_caption is required when use_short_caption=True")
-                        caption_short = item["short_caption"]
+                        caption_short = self.get_configured_caption(item, self.short_caption_field, "short_caption")
 
                 image_name = self.resolve_image_name(image_path, is_cn)
                 image, width, height = call_with_timeout(
