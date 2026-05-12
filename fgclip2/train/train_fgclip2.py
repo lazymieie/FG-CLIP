@@ -400,17 +400,38 @@ def load_existing_offsets_if_valid(
     return True
 
 
+def file_sha1(path: str) -> str:
+    digest = hashlib.sha1()
+    with open(path, "rb") as f:
+        while True:
+            chunk = f.read(1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def path_signature(path: Optional[str]) -> dict:
     if not path:
-        return {"path": None, "exists": False, "size": None, "mtime": None}
+        return {
+            "path": None,
+            "exists": False,
+            "size": None,
+            "mtime": None,
+            "content_sha1": None,
+        }
 
     abs_path = os.path.abspath(path)
     exists = os.path.exists(abs_path)
+    content_sha1 = None
+    if exists and os.path.isfile(abs_path) and abs_path.endswith(".txt"):
+        content_sha1 = file_sha1(abs_path)
     return {
         "path": abs_path,
         "exists": exists,
         "size": os.path.getsize(abs_path) if exists else None,
         "mtime": os.path.getmtime(abs_path) if exists else None,
+        "content_sha1": content_sha1,
     }
 
 
@@ -484,9 +505,14 @@ def valid_indices_cache_matches(
     for key, expected_path in (("data_path", data_path), ("cn_pair_root", cn_pair_root)):
         expected = path_signature(expected_path)
         actual = meta.get(key, {})
-        for field_name in ("path", "exists", "size", "mtime"):
+        for field_name in ("path", "exists", "size"):
             if actual.get(field_name) != expected.get(field_name):
                 return False
+        if expected.get("content_sha1") is not None:
+            if actual.get("content_sha1") != expected.get("content_sha1"):
+                return False
+        elif actual.get("mtime") != expected.get("mtime"):
+            return False
 
     return True
 
