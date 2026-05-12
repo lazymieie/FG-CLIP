@@ -47,7 +47,7 @@ class PNTextLoss(nn.Module):
 
 class FG_CLIP2_Model(Fgclip2Model):
     config_class = Fgclip2Config
-    main_input_name = "text_long"
+    main_input_name = "pixel_values"
 
     def __init__(self, config: Fgclip2Config):
         super().__init__(config)
