@@ -112,43 +112,53 @@ class FG_CLIP2_Model(Fgclip2Model):
             self.dense_feature_head.load_state_dict(self.vision_model.head.state_dict())
 
     def resize_postion_embeding(self, newsize=196):
+        embeddings = self.text_model.embeddings
+        old_position_embedding_res = embeddings.position_embedding_res
+        old_position_embedding_ori = embeddings.position_embedding_ori
+        base_position_embedding = embeddings.position_embedding.weight.data
 
-        old_position_embedding = self.text_model.embeddings.position_embedding
-        old_position_embedding_res = self.text_model.embeddings.position_embedding_res
-        old_position_embedding_ori = self.text_model.embeddings.position_embedding_ori
-        
-        
-        positional_embedding_pre = self.text_model.embeddings.position_embedding.weight.data
+        length, dim = base_position_embedding.shape
+        keep_len = self.text_model.config.keep_len
+        if newsize < keep_len:
+            raise ValueError(
+                f"newsize={newsize} must be >= keep_len={keep_len} for long-text positional embeddings"
+            )
 
-        length, dim = positional_embedding_pre.shape
-        keep_len = 20
-        posisitonal_embedding_new = torch.zeros([4*length-3*keep_len, dim], dtype=positional_embedding_pre.dtype)
-        for i in range(keep_len):
-            posisitonal_embedding_new[i] = positional_embedding_pre[i]
-        for i in range(length-1-keep_len):
-            posisitonal_embedding_new[4*i + keep_len] = positional_embedding_pre[i + keep_len]
-            posisitonal_embedding_new[4*i + 1 + keep_len] = 3*positional_embedding_pre[i + keep_len]/4 + 1*positional_embedding_pre[i+1+keep_len]/4
-            posisitonal_embedding_new[4*i + 2+keep_len] = 2*positional_embedding_pre[i+keep_len]/4 + 2*positional_embedding_pre[i+1+keep_len]/4
-            posisitonal_embedding_new[4*i + 3+keep_len] = 1*positional_embedding_pre[i+keep_len]/4 + 3*positional_embedding_pre[i+1+keep_len]/4
+        prefix = base_position_embedding[:keep_len]
+        tail = base_position_embedding[keep_len:]
+        target_tail_len = newsize - keep_len
 
-        posisitonal_embedding_new[4*length -3*keep_len - 4] = positional_embedding_pre[length-1] + 0*(positional_embedding_pre[length-1] - positional_embedding_pre[length-2])/4
-        posisitonal_embedding_new[4*length -3*keep_len - 3] = positional_embedding_pre[length-1] + 1*(positional_embedding_pre[length-1] - positional_embedding_pre[length-2])/4
-        posisitonal_embedding_new[4*length -3*keep_len - 2] = positional_embedding_pre[length-1] + 2*(positional_embedding_pre[length-1] - positional_embedding_pre[length-2])/4
-        posisitonal_embedding_new[4*length -3*keep_len - 1] = positional_embedding_pre[length-1] + 3*(positional_embedding_pre[length-1] - positional_embedding_pre[length-2])/4
-                
+        if target_tail_len == 0:
+            posisitonal_embedding_new = prefix.clone()
+        else:
+            resized_tail = F.interpolate(
+                tail.transpose(0, 1).unsqueeze(0),
+                size=target_tail_len,
+                mode="linear",
+                align_corners=True,
+            ).squeeze(0).transpose(0, 1)
+            posisitonal_embedding_new = torch.cat([prefix, resized_tail], dim=0)
+
         positional_embedding_res = posisitonal_embedding_new.clone()
+        device = old_position_embedding_ori.weight.device
+        dtype = old_position_embedding_ori.weight.dtype
 
-        self.text_model.embeddings.position_embedding_ori.weight.data = posisitonal_embedding_new
-        self.text_model.embeddings.position_embedding_ori.num_embeddings = posisitonal_embedding_new.shape[0]
-        
-        self.text_model.embeddings.position_embedding_res.weight.data = positional_embedding_res
-        self.text_model.embeddings.position_embedding_res.num_embeddings = positional_embedding_res.shape[0]
+        new_position_embedding_ori = nn.Embedding(newsize, dim, device=device, dtype=dtype)
+        new_position_embedding_res = nn.Embedding(newsize, dim, device=device, dtype=dtype)
+        new_position_embedding_ori.weight.data.copy_(posisitonal_embedding_new.to(device=device, dtype=dtype))
+        new_position_embedding_res.weight.data.copy_(positional_embedding_res.to(device=device, dtype=dtype))
+        new_position_embedding_ori.requires_grad_(old_position_embedding_ori.weight.requires_grad)
+        new_position_embedding_res.requires_grad_(old_position_embedding_res.weight.requires_grad)
 
-        old_position_embedding_ori_requires_grad = old_position_embedding_ori.weight.requires_grad
-        self.text_model.embeddings.position_embedding_ori.requires_grad_(old_position_embedding_ori_requires_grad)
-
-        old_position_embedding_res_requires_grad = old_position_embedding_res.weight.requires_grad
-        self.text_model.embeddings.position_embedding_res.requires_grad_(old_position_embedding_res_requires_grad)
+        embeddings.position_embedding_ori = new_position_embedding_ori
+        embeddings.position_embedding_res = new_position_embedding_res
+        embeddings.mask1 = torch.zeros([newsize, 1], device=device, dtype=dtype)
+        embeddings.mask1[:keep_len, :] = 1
+        embeddings.mask2 = torch.zeros([newsize, 1], device=device, dtype=dtype)
+        embeddings.mask2[keep_len:, :] = 1
+        embeddings.position_ids = torch.arange(newsize, device=device).expand((1, -1))
+        self.text_model.config.longtext_len = newsize
+        self.config.text_config.longtext_len = newsize
 
 
 

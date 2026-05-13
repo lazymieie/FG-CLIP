@@ -1779,7 +1779,7 @@ def train():
     
     if training_args.from_siglip2:
         print("copy and resize")
-        model.resize_postion_embeding()
+        model.resize_postion_embeding(newsize=data_args.max_seq_length)
         model.copy_weight()
         print("copy_weight")
         model.copy_dense_feature_head()
